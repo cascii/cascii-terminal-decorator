@@ -6,33 +6,33 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cascii_core_view::{
-    AnimationController, Frame, FrameFile, LoopMode, parse_cframe, parse_cframe_text,
+    AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, parse_cframe, parse_cframe_text,
 };
 use clap::Parser;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::style::{Color, Print, ResetColor, SetForegroundColor};
+use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
 #[derive(Debug, Parser)]
-#[command(
-    author,
-    version,
-    about = "Minimal crossterm player for cascii .cframe/.txt frames"
-)]
+#[command(author, version, about = "Minimal crossterm player for cascii .cframe/.txt frames")]
 struct Args {
     /// Directory containing frame files (frame_*.cframe or frame_*.txt)
     #[arg(default_value = ".")]
     directory: PathBuf,
 
-    /// Starting playback FPS
-    #[arg(long, default_value_t = 24)]
-    fps: u32,
+    /// Starting playback FPS (overrides details.toml)
+    #[arg(long)]
+    fps: Option<u32>,
 
     /// Play once instead of looping
     #[arg(long, default_value_t = false)]
     once: bool,
+
+    /// Enable colored rendering from .cframe data
+    #[arg(long, default_value_t = false)]
+    color: bool,
 }
 
 struct TerminalGuard {
@@ -43,9 +43,8 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         let mut stdout = io::stdout();
         terminal::enable_raw_mode().context("enabling raw mode")?;
-        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All))
-            .context("entering alternate screen")?;
-        Ok(Self { stdout })
+        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All)).context("entering alternate screen")?;
+        Ok(Self {stdout})
     }
 }
 
@@ -58,24 +57,25 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let frames = load_frames(&args.directory)?;
+    let details = load_project_details(&args.directory);
+    let colors = details.frame_colors();
+    let has_audio = details.audio.unwrap_or(false);
+    let fps = args.fps.unwrap_or_else(|| details.fps.unwrap_or(24));
+
+    let frames = load_frames(&args.directory, args.color)?;
     let has_any_color = frames.iter().any(Frame::has_color);
 
-    let mut controller = AnimationController::new(args.fps);
+    let mut controller = AnimationController::new(fps);
     controller.set_frame_count(frames.len());
     if args.once {
         controller.set_loop_mode(LoopMode::Once);
     }
     controller.play();
 
-    run_player(frames, has_any_color, controller)
+    run_player(frames, has_any_color, has_audio, colors, controller)
 }
 
-fn run_player(
-    frames: Vec<Frame>,
-    has_any_color: bool,
-    mut controller: AnimationController,
-) -> Result<()> {
+fn run_player(frames: Vec<Frame>, has_any_color: bool, has_audio: bool, colors: FrameColors, mut controller: AnimationController) -> Result<()> {
     if frames.is_empty() {
         bail!("No frames to display");
     }
@@ -87,21 +87,9 @@ fn run_player(
     loop {
         if needs_redraw {
             let current_idx = controller.current_frame();
-            let frame = frames
-                .get(current_idx)
-                .context("current frame index out of bounds")?;
-            render_frame(
-                &mut terminal.stdout,
-                frame,
-                &controller,
-                current_idx,
-                frames.len(),
-                has_any_color,
-            )?;
-            terminal
-                .stdout
-                .flush()
-                .context("flushing terminal output")?;
+            let frame = frames.get(current_idx).context("current frame index out of bounds")?;
+            render_frame(&mut terminal.stdout, frame, &controller, current_idx, frames.len(), has_any_color, has_audio, &colors)?;
+            terminal.stdout.flush().context("flushing terminal output")?;
             needs_redraw = false;
         }
 
@@ -187,19 +175,13 @@ fn run_player(
     Ok(())
 }
 
-fn render_frame(
-    stdout: &mut Stdout,
-    frame: &Frame,
-    controller: &AnimationController,
-    frame_index: usize,
-    total_frames: usize,
-    has_any_color: bool,
-) -> Result<()> {
+fn render_frame(stdout: &mut Stdout, frame: &Frame, controller: &AnimationController, frame_index: usize, total_frames: usize, has_any_color: bool, has_audio: bool, colors: &FrameColors) -> Result<()> {
     let (term_width, term_height) = terminal::size().context("reading terminal size")?;
     let drawable_height = term_height.saturating_sub(1) as usize;
     let term_width_usize = term_width as usize;
 
-    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All)).context("clearing frame")?;
+    let (bg_r, bg_g, bg_b) = colors.background;
+    queue!(stdout, MoveTo(0, 0), SetBackgroundColor(Color::Rgb {r: bg_r, g: bg_g, b: bg_b}), Clear(ClearType::All)).context("clearing frame")?;
 
     if let Some(cframe) = frame.cframe.as_ref() {
         let frame_width = cframe.width as usize;
@@ -238,38 +220,19 @@ fn render_frame(
                     col += 1;
                 }
 
-                queue!(
-                    stdout,
-                    MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16),
-                    SetForegroundColor(Color::Rgb { r, g, b }),
-                    Print(&run)
-                )
+                queue!(stdout, MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16), SetForegroundColor(Color::Rgb {r, g, b}), Print(&run))
                 .context("drawing colored run")?;
             }
         }
     } else {
-        draw_text_frame(stdout, frame, term_width_usize, drawable_height)?;
+        draw_text_frame(stdout, frame, term_width_usize, drawable_height, colors)?;
     }
 
-    draw_status_line(
-        stdout,
-        controller,
-        frame_index,
-        total_frames,
-        has_any_color,
-        term_width,
-        term_height,
-    )?;
-
+    draw_status_line(stdout, controller, frame_index, total_frames, has_any_color, has_audio, term_width, term_height)?;
     Ok(())
 }
 
-fn draw_text_frame(
-    stdout: &mut Stdout,
-    frame: &Frame,
-    term_width: usize,
-    drawable_height: usize,
-) -> Result<()> {
+fn draw_text_frame(stdout: &mut Stdout, frame: &Frame, term_width: usize, drawable_height: usize, colors: &FrameColors) -> Result<()> {
     let lines: Vec<&str> = frame.content.lines().collect();
     let frame_height = lines.len();
     let frame_width = lines.iter().map(|line| line.len()).max().unwrap_or(0);
@@ -296,12 +259,8 @@ fn draw_text_frame(
             }
 
             let text = std::str::from_utf8(&bytes[start_col..col]).unwrap_or("");
-            queue!(
-                stdout,
-                MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16),
-                SetForegroundColor(Color::White),
-                Print(text)
-            )
+            let (fg_r, fg_g, fg_b) = colors.foreground;
+            queue!(stdout, MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16), SetForegroundColor(Color::Rgb {r: fg_r, g: fg_g, b: fg_b}), Print(text))
             .context("drawing text run")?;
         }
     }
@@ -310,45 +269,17 @@ fn draw_text_frame(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_status_line(
-    stdout: &mut Stdout,
-    controller: &AnimationController,
-    frame_index: usize,
-    total_frames: usize,
-    has_any_color: bool,
-    term_width: u16,
-    term_height: u16,
-) -> Result<()> {
+fn draw_status_line(stdout: &mut Stdout, controller: &AnimationController, frame_index: usize, total_frames: usize, has_any_color: bool, has_audio: bool, term_width: u16, term_height: u16) -> Result<()> {
     let playback_state = format!("{:?}", controller.state()).to_lowercase();
     let loop_mode = match controller.loop_mode() {
         LoopMode::Loop => "loop",
         LoopMode::Once => "once",
     };
-    let status = format!(
-        "frame {}/{} | {} | {} fps | {} | color:{} | [space] play/pause [←/→] step [+/-] fps [l] loop [q] quit",
-        frame_index + 1,
-        total_frames,
-        playback_state,
-        controller.fps(),
-        loop_mode,
-        if has_any_color { "on" } else { "off" }
-    );
-
+    let status = format!("frame {}/{} | {} | {} fps | {} | color:{} | audio:{} | [space] play/pause [←/→] step [+/-] fps [l] loop [q] quit", frame_index + 1, total_frames, playback_state, controller.fps(), loop_mode, if has_any_color {"on"} else {"off"}, if has_audio {"yes"} else {"no"});
     let status_line = truncate_to_width(&status, term_width as usize);
     let y = term_height.saturating_sub(1);
     let clear_line = " ".repeat(term_width as usize);
-
-    queue!(
-        stdout,
-        MoveTo(0, y),
-        SetForegroundColor(Color::DarkGrey),
-        Print(clear_line),
-        MoveTo(0, y),
-        Print(status_line),
-        ResetColor
-    )
-    .context("drawing status line")?;
-
+    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(clear_line), MoveTo(0, y), Print(status_line), ResetColor).context("drawing status line")?;
     Ok(())
 }
 
@@ -356,58 +287,61 @@ fn truncate_to_width(input: &str, width: usize) -> String {
     input.chars().take(width).collect()
 }
 
-fn load_frames(directory: &Path) -> Result<Vec<Frame>> {
-    let cframe_paths = collect_frame_paths(directory, "cframe", false)?;
-    if !cframe_paths.is_empty() {
-        let mut frames = Vec::with_capacity(cframe_paths.len());
-        for path in cframe_paths {
-            let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            let cframe = parse_cframe(&data)
-                .with_context(|| format!("parsing .cframe file {}", path.display()))?;
-            let text = parse_cframe_text(&data)
-                .with_context(|| format!("extracting text from {}", path.display()))?;
-            frames.push(Frame::with_color(text, cframe));
+fn load_project_details(directory: &Path) -> ProjectDetails {
+    let toml_path = directory.join("details.toml");
+    if let Ok(content) = fs::read_to_string(&toml_path) {
+        ProjectDetails::from_toml_str(&content).unwrap_or_default()
+    } else {
+        ProjectDetails::default()
+    }
+}
+
+fn load_frames(directory: &Path, use_color: bool) -> Result<Vec<Frame>> {
+    // Prefer .txt files when available (monochrome by default).
+    let txt_paths = collect_frame_paths(directory, "txt", true)?;
+    if !txt_paths.is_empty() {
+        let mut frames = Vec::with_capacity(txt_paths.len());
+        for txt_path in &txt_paths {
+            let content = fs::read_to_string(txt_path).with_context(|| format!("reading {}", txt_path.display()))?;
+            let content = normalize_frame_text(content);
+            let cframe_path = txt_path.with_extension("cframe");
+
+            if use_color && cframe_path.exists() {
+                let data = fs::read(&cframe_path).with_context(|| format!("reading {}", cframe_path.display()))?;
+                let cframe = parse_cframe(&data).with_context(|| format!("parsing .cframe file {}", cframe_path.display()))?;
+                frames.push(Frame::with_color(content, cframe));
+            } else {
+                frames.push(Frame::text_only(content));
+            }
         }
         return Ok(frames);
     }
 
-    let txt_paths = collect_frame_paths(directory, "txt", true)?;
-    if txt_paths.is_empty() {
-        bail!(
-            "No frame files found in {} (expected .cframe or frame_*.txt)",
-            directory.display()
-        );
+    // Fallback: load .cframe files directly when no .txt files exist.
+    let cframe_paths = collect_frame_paths(directory, "cframe", false)?;
+    if cframe_paths.is_empty() {
+        bail!("No frame files found in {} (expected .cframe or frame_*.txt)", directory.display());
     }
 
-    let mut frames = Vec::with_capacity(txt_paths.len());
-    for txt_path in txt_paths {
-        let content = fs::read_to_string(&txt_path)
-            .with_context(|| format!("reading {}", txt_path.display()))?;
-        let content = normalize_frame_text(content);
-        let cframe_path = txt_path.with_extension("cframe");
-
-        if cframe_path.exists() {
-            let data = fs::read(&cframe_path)
-                .with_context(|| format!("reading {}", cframe_path.display()))?;
-            let cframe = parse_cframe(&data)
-                .with_context(|| format!("parsing .cframe file {}", cframe_path.display()))?;
-            frames.push(Frame::with_color(content, cframe));
+    let mut frames = Vec::with_capacity(cframe_paths.len());
+    for path in cframe_paths {
+        let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let cframe = parse_cframe(&data)
+            .with_context(|| format!("parsing .cframe file {}", path.display()))?;
+        let text = parse_cframe_text(&data)
+            .with_context(|| format!("extracting text from {}", path.display()))?;
+        if use_color {
+            frames.push(Frame::with_color(text, cframe));
         } else {
-            frames.push(Frame::text_only(content));
+            frames.push(Frame::text_only(text));
         }
     }
 
     Ok(frames)
 }
 
-fn collect_frame_paths(
-    directory: &Path,
-    extension: &str,
-    require_frame_prefix: bool,
-) -> Result<Vec<PathBuf>> {
-    let entries = fs::read_dir(directory)
-        .with_context(|| format!("reading frame directory {}", directory.display()))?;
-
+fn collect_frame_paths(directory: &Path, extension: &str, require_frame_prefix: bool) -> Result<Vec<PathBuf>> {
+    let entries = fs::read_dir(directory).with_context(|| format!("reading frame directory {}", directory.display()))?;
     let mut indexed = Vec::new();
     for (fallback, entry) in entries.enumerate() {
         let entry = entry.with_context(|| format!("reading entry in {}", directory.display()))?;
@@ -423,11 +357,7 @@ fn collect_frame_paths(
             continue;
         }
 
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default().to_string();
         if require_frame_prefix && !name.starts_with("frame_") {
             continue;
         }
