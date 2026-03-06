@@ -5,33 +5,61 @@ Minimal `crossterm` TUI player for `cascii` frame output, reusing
 
 ## What It Plays
 
-- `.cframe` files (preferred, full RGB per character)
-- `frame_*.txt` files (text-only), with optional same-name `.cframe` sidecars
+- `frame_*.txt` files (text-only), loaded first when present
+- `.cframe` files (full RGB per character), used as sidecars alongside `.txt` files or standalone when no `.txt` files exist
+- When both `frame_*.txt` and matching `.cframe` files exist, pass `--color` to enable colored rendering
+
+## Install
+
+```bash
+# Build and install as `casciit` to /usr/local/bin
+./install.sh
+
+# Or install to a custom directory
+INSTALL_DIR=~/.local/bin ./install.sh
+```
 
 ## Build
 
 ```bash
-cargo build
+cargo build --release
 ```
 
-## Run
+Requires the sibling `cascii-core-view` crate (`../cascii-core-view`).
+
+## Usage
 
 ```bash
-# Play frames in current directory
-cargo run -- .
+# Play frames in current directory (default 24 FPS, looping)
+casciit .
 
 # Play frames in a specific directory at 30 FPS
-cargo run -- /path/to/frames --fps 30
+casciit /path/to/frames --fps 30
 
 # Play once (no loop)
-cargo run -- /path/to/frames --once
+casciit /path/to/frames --once
+
+# Enable colored rendering from .cframe data
+casciit /path/to/frames --color
+```
+
+Or via `cargo run`:
+
+```bash
+cargo run -- /path/to/frames --fps 30 --color
 ```
 
 ## Controls
 
-- `q` / `Esc`: quit
-- `Space`: play/pause
-- `Left` / `Right`: step backward/forward
-- `Home` / `End`: jump to first/last frame
-- `+` / `-`: increase/decrease FPS
-- `l`: toggle loop/once
+| Key              | Action                   |
+| ---------------- | ------------------------ |
+| `q` / `Esc`      | Quit                     |
+| `Space`          | Play / pause             |
+| `Left` / `Right` | Step backward / forward  |
+| `Home` / `End`   | Jump to first / last frame |
+| `+` / `-`        | Increase / decrease FPS  |
+| `l`              | Toggle loop / once       |
+
+## License
+
+MIT
