@@ -66,7 +66,9 @@ checksum = "812e12b5285cc515a9c72a5c1d3b6d46a19dac5acfef5265968c166106e31dd3"
 
 [[package]]
 name = "cascii-core-view"
-version = "0.2.0"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13345a110755e1d71841cad5aba0ec3eaef39c0c4cd87ee7465ddda322cf1dbf"
 dependencies = [
  "serde",
  "toml",
@@ -74,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "cascii-terminal-decorator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cascii-core-view",

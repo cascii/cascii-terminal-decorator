@@ -7,7 +7,9 @@ Minimal `crossterm` TUI player for `cascii` frame output, reusing
 
 - `frame_*.txt` files (text-only), loaded first when present
 - `.cframe` files (full RGB per character), used as sidecars alongside `.txt` files or standalone when no `.txt` files exist
+- packed multi-frame blobs via `--packed`, including the optional per-cell background-color extension when `--color` is enabled
 - When both `frame_*.txt` and matching `.cframe` files exist, pass `--color` to enable colored rendering
+- Frames are scaled down automatically to fit the terminal while preserving their character-grid aspect ratio; smaller frames are not enlarged
 
 ## Install
 
@@ -25,7 +27,7 @@ INSTALL_DIR=~/.local/bin ./install.sh
 cargo build --release
 ```
 
-Requires the sibling `cascii-core-view` crate (`../cascii-core-view`).
+`cascii-core-view` is resolved from crates.io.
 
 ## Usage
 
@@ -41,6 +43,15 @@ casciit /path/to/frames --once
 
 # Enable colored rendering from .cframe data
 casciit /path/to/frames --color
+
+# Play a packed multi-frame blob (relative to the frame directory)
+casciit /path/to/frames --packed animation.cframes --color
+
+# Play a subsection of an animation (normalized positions from 0.0 to 1.0)
+casciit /path/to/frames --start 0.25 --end 0.75
+
+# Keep native frame dimensions and crop anything outside the terminal
+casciit /path/to/frames --no-fit
 ```
 
 Or via `cargo run`:
@@ -51,14 +62,18 @@ cargo run -- /path/to/frames --fps 30 --color
 
 ## Controls
 
-| Key              | Action                   |
-| ---------------- | ------------------------ |
-| `q` / `Esc`      | Quit                     |
-| `Space`          | Play / pause             |
-| `Left` / `Right` | Step backward / forward  |
-| `Home` / `End`   | Jump to first / last frame |
-| `+` / `-`        | Increase / decrease FPS  |
-| `l`              | Toggle loop / once       |
+| Key              | Action                            |
+| ---------------- | --------------------------------- |
+| `q` / `Esc`      | Quit                              |
+| `Space`          | Play / pause                      |
+| `Left` / `Right` | Step backward / forward           |
+| `Home` / `End`   | Jump to active range start / end  |
+| `+` / `-`        | Increase / decrease FPS           |
+| `f`              | Toggle fit-to-terminal             |
+| `l`              | Toggle loop / once                |
+
+`--start` and `--end` set a playback range. `Home` and `End` jump to that
+range's first and last frames.
 
 ## License
 

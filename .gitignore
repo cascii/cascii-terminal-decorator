@@ -23,4 +23,6 @@ target
 .DS_Store
 eth/
 .claude/settings.local.json
+.ssmver/
 .docs/
+.temp/

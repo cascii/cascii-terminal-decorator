@@ -1,0 +1,11 @@
+version = "0.19.0"
+frames = 87
+luminance = 1
+font_ratio = 0.699999988079071
+columns = 100
+fps = 30
+output = "text+color"
+audio = false
+background_color = "black"
+color = "white"
+fit_cell_backgrounds = true
