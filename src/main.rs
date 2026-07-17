@@ -19,7 +19,7 @@ use crossterm::{execute, queue};
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Minimal crossterm player for cascii .cframe/.txt frames")]
 struct Args {
-    /// Directory containing frame files (frame_*.cframe or frame_*.txt)
+    /// Directory containing frame files (frame_*.cframe or frame_*.txt), or a packed animation blob file
     #[arg(default_value = ".")]
     directory: PathBuf,
 
@@ -35,7 +35,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     color: bool,
 
-    /// Packed multi-frame .cframe blob to play (relative paths use DIRECTORY)
+    /// Packed multi-frame blob to play: CFPK .bin (cascii-studio export) or legacy packed .cframes (relative paths use DIRECTORY)
     #[arg(long, value_name = "FILE")]
     packed: Option<PathBuf>,
 
@@ -81,13 +81,16 @@ impl Drop for TerminalGuard {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let details = load_project_details(&args.directory);
+    let details_dir = if args.directory.is_file() {args.directory.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."))} else {args.directory.clone()};
+    let details = load_project_details(&details_dir);
     let colors = details.frame_colors();
     let has_audio = details.audio.unwrap_or(false);
     let fps = args.fps.unwrap_or_else(|| details.fps.unwrap_or(24));
 
     let frames = if let Some(packed_path) = args.packed.as_ref() {
-        load_packed_frames(&resolve_packed_path(&args.directory, packed_path), args.color)?
+        load_packed_frames(&resolve_packed_path(&details_dir, packed_path), args.color)?
+    } else if args.directory.is_file() {
+        load_packed_frames(&args.directory, args.color)?
     } else {
         load_frames(&args.directory, args.color)?
     };
@@ -475,7 +478,60 @@ fn load_packed_frames(path: &Path, use_color: bool) -> Result<Vec<Frame>> {
     frames_from_packed_data(&data, use_color).with_context(|| format!("parsing packed animation {}", path.display()))
 }
 
+const CFPK_MAGIC: &[u8; 4] = b"CFPK";
+const CFPK_VERSION: u32 = 1;
+const CFPK_HEADER_SIZE: usize = 12;
+
 fn frames_from_packed_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
+    if data.starts_with(CFPK_MAGIC) {
+        return frames_from_cfpk_data(data, use_color);
+    }
+    frames_from_legacy_packed_data(data, use_color)
+}
+
+fn frames_from_cfpk_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
+    if data.len() < CFPK_HEADER_SIZE {
+        bail!("CFPK blob is too small ({} bytes)", data.len());
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != CFPK_VERSION {
+        bail!("Unsupported CFPK version: {version}");
+    }
+    let frame_count = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+    if frame_count == 0 {
+        bail!("CFPK blob contains no frames");
+    }
+
+    let mut offset = CFPK_HEADER_SIZE;
+    let mut frames = Vec::with_capacity(frame_count);
+    for index in 0..frame_count {
+        if offset + 4 > data.len() {
+            bail!("CFPK blob is truncated before the length of frame {index}");
+        }
+        let frame_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + frame_len > data.len() {
+            bail!("CFPK blob is truncated inside the payload of frame {index}");
+        }
+        let bytes = &data[offset..offset + frame_len];
+        offset += frame_len;
+
+        let cframe = parse_cframe(bytes).with_context(|| format!("parsing CFPK frame {index}"))?;
+        let text = parse_cframe_text(bytes).with_context(|| format!("extracting text from CFPK frame {index}"))?;
+        if use_color {
+            frames.push(Frame::with_color(text, cframe));
+        } else {
+            frames.push(Frame::text_only(text));
+        }
+    }
+
+    if offset != data.len() {
+        bail!("CFPK blob has {} trailing bytes", data.len() - offset);
+    }
+    Ok(frames)
+}
+
+fn frames_from_legacy_packed_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
     let blob = parse_packed_cframes(data)?;
     let mut frames = Vec::with_capacity(blob.len());
     for index in 0..blob.len() {
@@ -630,6 +686,72 @@ mod tests {
         let cframe = frames[0].cframe.as_ref().unwrap();
         assert_eq!(cframe.bg_rgb_at(0, 0), Some((10, 20, 30)));
         assert_eq!(cframe.bg_rgb_at(0, 1), Some((40, 50, 60)));
+    }
+
+    fn cfpk_blob(frames: &[&[u8]]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"CFPK");
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        for frame in frames {
+            data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            data.extend_from_slice(frame);
+        }
+        data
+    }
+
+    #[test]
+    fn decodes_cfpk_blobs_with_backgrounds() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&2_u32.to_le_bytes());
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&[b'A', 255, 0, 0, b'B', 0, 255, 0]);
+        frame.push(cascii_core_view::CFRAME_EXT_FLAG_HAS_BG);
+        frame.extend_from_slice(&[10, 20, 30, 40, 50, 60]);
+
+        let frames = frames_from_packed_data(&cfpk_blob(&[&frame, &frame]), true).unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].content, "AB\n");
+        let cframe = frames[0].cframe.as_ref().unwrap();
+        assert_eq!(cframe.rgb_at(0, 0), Some((255, 0, 0)));
+        assert_eq!(cframe.bg_rgb_at(0, 1), Some((40, 50, 60)));
+    }
+
+    #[test]
+    fn cfpk_blobs_can_use_the_text_fallback() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&[b'X', 255, 255, 255]);
+
+        let frames = frames_from_packed_data(&cfpk_blob(&[&frame]), false).unwrap();
+
+        assert_eq!(frames[0].content, "X\n");
+        assert!(frames[0].cframe.is_none());
+    }
+
+    #[test]
+    fn rejects_corrupt_cfpk_blobs() {
+        assert!(frames_from_packed_data(b"CFPK", true).is_err());
+
+        let mut wrong_version = cfpk_blob(&[]);
+        wrong_version[4] = 2;
+        assert!(frames_from_packed_data(&wrong_version, true).is_err());
+
+        assert!(frames_from_packed_data(&cfpk_blob(&[]), true).is_err());
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&1_u32.to_le_bytes());
+        frame.extend_from_slice(&[b'X', 255, 255, 255]);
+        let mut truncated = cfpk_blob(&[&frame]);
+        truncated.truncate(truncated.len() - 2);
+        assert!(frames_from_packed_data(&truncated, true).is_err());
+
+        let mut trailing = cfpk_blob(&[&frame]);
+        trailing.push(0);
+        assert!(frames_from_packed_data(&trailing, true).is_err());
     }
 
     #[test]
