@@ -5,23 +5,82 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use cascii_core_view::{
-    AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, parse_cframe, parse_cframe_text,
-    parse_packed_cframes,
-};
-use clap::Parser;
+use cascii_core_view::{AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, parse_cframe, parse_cframe_text, parse_packed_cframes};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{execute, queue};
 
+mod library;
+mod settings;
+
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Minimal crossterm player for cascii .cframe/.txt frames")]
-struct Args {
-    /// Directory containing frame files (frame_*.cframe or frame_*.txt)
+#[command(author, version, about = "Terminal player for Cascii frame directories and packed binaries")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    playback: PlaybackArgs,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Play frames from a path or from a saved animation name
+    Play(PlaybackArgs),
+
+    /// Save a frame directory or packed binary for later playback
+    Save {
+        /// File or directory containing the animation frames
+        source: PathBuf,
+
+        /// Name used to save and play the animation (defaults to the source name)
+        name: Option<String>,
+    },
+
+    /// Show or change persistent settings
+    Config(ConfigArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+struct ConfigArgs {
+    #[command(subcommand)]
+    command: Option<ConfigCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigCommand {
+    /// Create settings.json if it does not exist
+    Init,
+
+    /// Print all settings as JSON
+    Show,
+
+    /// Print the path to settings.json
+    Path,
+
+    /// Change a setting
+    Set {
+        #[command(subcommand)]
+        setting: ConfigSetting,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ConfigSetting {
+    /// Set the directory where named animations are saved
+    SavePath {
+        path: PathBuf,
+    },
+}
+
+#[derive(Debug, ClapArgs)]
+struct PlaybackArgs {
+    /// Frame directory, packed binary path, or saved animation name
     #[arg(default_value = ".")]
-    directory: PathBuf,
+    path: PathBuf,
 
     /// Starting playback FPS (overrides details.toml)
     #[arg(long)]
@@ -35,7 +94,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     color: bool,
 
-    /// Packed multi-frame .cframe blob to play (relative paths use DIRECTORY)
+    /// Packed multi-frame blob to play (relative paths use PATH)
     #[arg(long, value_name = "FILE")]
     packed: Option<PathBuf>,
 
@@ -80,16 +139,110 @@ impl Drop for TerminalGuard {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
-    let details = load_project_details(&args.directory);
+    let cli = Cli::parse();
+    let app_paths = settings::app_paths()?;
+    let mut app_settings = settings::load_or_create(&app_paths)?;
+
+    match cli.command {
+        Some(Command::Play(args)) => play(args, &app_settings),
+        Some(Command::Save {source, name}) => {
+            let (name, destination) = save_animation(&source, name, &app_settings.save_path)?;
+            println!("Saved '{name}' to {}", destination.display());
+            println!("Play it with: {} play {name}", settings::APP_NAME);
+            Ok(())
+        }
+        Some(Command::Config(args)) => run_config(args, &app_paths, &mut app_settings),
+        None => play(cli.playback, &app_settings),
+    }
+}
+
+fn save_animation(source: &Path, requested_name: Option<String>, save_path: &Path) -> Result<(String, PathBuf)> {
+    validate_animation_source(source)?;
+    let name = match requested_name {
+        Some(name) => name,
+        None => infer_save_name(source)?,
+    };
+    let destination = library::save(source, &name, save_path)?;
+    Ok((name, destination))
+}
+
+fn infer_save_name(source: &Path) -> Result<String> {
+    let metadata = fs::metadata(source)
+        .with_context(|| format!("reading source path {}", source.display()))?;
+    let resolved_source = if source.file_name().is_some() {
+        source.to_path_buf()
+    } else {
+        source.canonicalize()
+            .with_context(|| format!("resolving source path {}", source.display()))?
+    };
+    let candidate = if metadata.is_file() {
+        resolved_source.file_stem()
+    } else {
+        resolved_source.file_name()
+    };
+    let name = candidate.and_then(|value| value.to_str()).filter(|value| !value.is_empty()).with_context(|| format!("cannot infer an animation name from {}; provide NAME explicitly", source.display()))?;
+    Ok(name.to_string())
+}
+
+fn validate_animation_source(source: &Path) -> Result<()> {
+    if source.is_file() {
+        load_packed_frames(source, true)?;
+        return Ok(());
+    }
+    if source.is_dir() {
+        if let Some(binary) = find_standalone_binary(source)? {
+            load_packed_frames(&binary, true)?;
+        } else {
+            load_frames(source, true)?;
+        }
+        return Ok(());
+    }
+    bail!("Animation source must be a readable frame directory or packed binary: {}", source.display())
+}
+
+fn run_config(args: ConfigArgs, app_paths: &settings::AppPaths, app_settings: &mut settings::Settings) -> Result<()> {
+    match args.command.unwrap_or(ConfigCommand::Show) {
+        ConfigCommand::Init => {
+            println!("Settings initialized at {}", app_paths.settings_file.display());
+        }
+        ConfigCommand::Show => {
+            println!("{}", serde_json::to_string_pretty(app_settings).context("serializing settings")?);
+        }
+        ConfigCommand::Path => {
+            println!("{}", app_paths.settings_file.display());
+        }
+        ConfigCommand::Set {setting: ConfigSetting::SavePath {path}} => {
+            settings::set_save_path(app_paths, app_settings, &path)?;
+            println!("Save path set to {}", app_settings.save_path.display());
+        }
+    }
+    Ok(())
+}
+
+fn play(mut args: PlaybackArgs, app_settings: &settings::Settings) -> Result<()> {
+    args.path = library::resolve(&args.path, &app_settings.save_path);
+    let direct_binary = args.path.is_file().then(|| args.path.clone());
+    let discovered_binary = if direct_binary.is_none() && args.packed.is_none() && args.path.is_dir() {
+        find_standalone_binary(&args.path)?
+    } else {
+        None
+    };
+    let binary_path = direct_binary.or(discovered_binary);
+    let details_directory = binary_path.as_ref().and_then(|path| path.parent()).unwrap_or(&args.path);
+    let details = load_project_details(details_directory);
     let colors = details.frame_colors();
     let has_audio = details.audio.unwrap_or(false);
     let fps = args.fps.unwrap_or_else(|| details.fps.unwrap_or(24));
 
     let frames = if let Some(packed_path) = args.packed.as_ref() {
-        load_packed_frames(&resolve_packed_path(&args.directory, packed_path), args.color)?
+        if !args.path.is_dir() {
+            bail!("The playback path must be a directory when --packed is used");
+        }
+        load_packed_frames(&resolve_packed_path(&args.path, packed_path), args.color)?
+    } else if let Some(binary_path) = binary_path {
+        load_packed_frames(&binary_path, args.color)?
     } else {
-        load_frames(&args.directory, args.color)?
+        load_frames(&args.path, args.color)?
     };
     let has_any_color = frames.iter().any(Frame::has_color);
 
@@ -363,8 +516,7 @@ fn draw_text_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, term_width: us
 
 fn sample_text_line(line: &str, source_width: usize, draw_width: usize, fit_to_terminal: bool) -> Vec<char> {
     let characters: Vec<char> = line.chars().collect();
-    (0..draw_width)
-        .map(|col| {
+    (0..draw_width).map(|col| {
             let source_col = source_index(col, draw_width, source_width, fit_to_terminal);
             characters.get(source_col).copied().unwrap_or(' ')
         }).collect()
@@ -472,7 +624,66 @@ fn load_frames(directory: &Path, use_color: bool) -> Result<Vec<Frame>> {
 
 fn load_packed_frames(path: &Path, use_color: bool) -> Result<Vec<Frame>> {
     let data = fs::read(path).with_context(|| format!("reading packed animation {}", path.display()))?;
-    frames_from_packed_data(&data, use_color).with_context(|| format!("parsing packed animation {}", path.display()))
+    frames_from_binary_data(&data, use_color).with_context(|| format!("parsing packed animation {}", path.display()))
+}
+
+fn frames_from_binary_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
+    if data.starts_with(b"CFPK") {
+        frames_from_full_cframe_pack(data, use_color)
+    } else {
+        frames_from_packed_data(data, use_color)
+    }
+}
+
+fn frames_from_full_cframe_pack(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
+    const HEADER_SIZE: usize = 12;
+    const SUPPORTED_VERSION: u32 = 1;
+
+    if data.len() < HEADER_SIZE {
+        bail!("full cframe pack is too small");
+    }
+    if &data[0..4] != b"CFPK" {
+        bail!("full cframe pack has invalid magic");
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().expect("validated CFPK version bytes"));
+    if version != SUPPORTED_VERSION {
+        bail!("unsupported full cframe pack version: {version}");
+    }
+    let frame_count = u32::from_le_bytes(data[8..12].try_into().expect("validated CFPK frame count bytes")) as usize;
+    if frame_count == 0 {
+        bail!("full cframe pack contains no frames");
+    }
+
+    let mut frames = Vec::with_capacity(frame_count);
+    let mut offset = HEADER_SIZE;
+    for frame_index in 0..frame_count {
+        let length_end = offset.checked_add(4).context("full cframe pack offset overflow")?;
+        if length_end > data.len() {
+            bail!("full cframe pack is truncated before frame {frame_index} length");
+        }
+        let frame_len = u32::from_le_bytes(data[offset..length_end].try_into().expect("validated CFPK frame length bytes")) as usize;
+        offset = length_end;
+        let frame_end = offset.checked_add(frame_len).context("full cframe pack frame length overflow")?;
+        if frame_end > data.len() {
+            bail!("full cframe pack is truncated inside frame {frame_index}");
+        }
+
+        let frame_data = &data[offset..frame_end];
+        let cframe = parse_cframe(frame_data)
+            .with_context(|| format!("parsing full cframe pack frame {frame_index}"))?;
+        let text = cframe.to_text();
+        if use_color {
+            frames.push(Frame::with_color(text, cframe));
+        } else {
+            frames.push(Frame::text_only(text));
+        }
+        offset = frame_end;
+    }
+
+    if offset != data.len() {
+        bail!("full cframe pack has {} trailing bytes", data.len() - offset);
+    }
+    Ok(frames)
 }
 
 fn frames_from_packed_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
@@ -488,6 +699,33 @@ fn frames_from_packed_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
         }
     }
     Ok(frames)
+}
+
+fn find_standalone_binary(directory: &Path) -> Result<Option<PathBuf>> {
+    if !collect_frame_paths(directory, "txt", true)?.is_empty() || !collect_frame_paths(directory, "cframe", false)?.is_empty() {
+        return Ok(None);
+    }
+
+    let mut binaries = Vec::new();
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("reading frame directory {}", directory.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry in {}", directory.display()))?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_binary = path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("bin") || extension.eq_ignore_ascii_case("cframes"));
+        if is_binary {
+            binaries.push(path);
+        }
+    }
+    binaries.sort();
+    match binaries.len() {
+        0 => Ok(None),
+        1 => Ok(binaries.pop()),
+        _ => bail!("Multiple packed binaries found in {}; pass one as the playback path", directory.display()),
+    }
 }
 
 fn collect_frame_paths(directory: &Path, extension: &str, require_frame_prefix: bool) -> Result<Vec<PathBuf>> {
@@ -531,6 +769,79 @@ fn normalize_frame_text(mut text: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_the_legacy_direct_playback_form() {
+        let cli = Cli::try_parse_from(["casciit", "frames", "--once"]).unwrap();
+
+        assert!(cli.command.is_none());
+        assert_eq!(cli.playback.path, PathBuf::from("frames"));
+        assert!(cli.playback.once);
+    }
+
+    #[test]
+    fn parses_the_named_save_command() {
+        let cli = Cli::try_parse_from(["casciit", "save", "frames", "demo-reel"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Save {source, name: Some(name)}) if source == PathBuf::from("frames") && name == "demo-reel"));
+    }
+
+    #[test]
+    fn parses_the_save_command_without_a_name() {
+        let cli = Cli::try_parse_from(["casciit", "save", "test/eth"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Save {source, name: None}) if source == PathBuf::from("test/eth")));
+    }
+
+    #[test]
+    fn infers_the_final_directory_name_after_validating_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("test/eth");
+        let save_path = temp.path().join("library");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("frame_0001.txt"), "hello").unwrap();
+
+        let (name, destination) = save_animation(&source, None, &save_path).unwrap();
+
+        assert_eq!(name, "eth");
+        assert_eq!(destination, save_path.join("eth"));
+        assert_eq!(fs::read_to_string(destination.join("frame_0001.txt")).unwrap(), "hello");
+    }
+
+    #[test]
+    fn infers_a_binary_name_without_its_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("family-guy_cframes.bin");
+        fs::write(&source, full_cframe_pack(&[encoded_cframe(b'A', [1, 2, 3])])).unwrap();
+
+        let (name, _) = save_animation(&source, None, &temp.path().join("library")).unwrap();
+
+        assert_eq!(name, "family-guy_cframes");
+    }
+
+    #[test]
+    fn refuses_to_save_a_directory_without_readable_frames() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("not-frames");
+        let save_path = temp.path().join("library");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("README.md"), "not an animation").unwrap();
+
+        assert!(save_animation(&source, None, &save_path).is_err());
+        assert!(!save_path.exists());
+    }
+
+    #[test]
+    fn validates_the_eth_frame_fixture_before_saving() {
+        validate_animation_source(Path::new("test/eth")).unwrap();
+    }
+
+    #[test]
+    fn parses_the_save_path_setting_command() {
+        let cli = Cli::try_parse_from(["casciit", "config", "set", "save-path", "library"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::SavePath {path}})})) if path == PathBuf::from("library")));
+    }
 
     #[test]
     fn configures_a_playback_range_and_starts_at_its_first_frame() {
@@ -611,6 +922,68 @@ mod tests {
     #[test]
     fn text_sampling_preserves_unicode_characters() {
         assert_eq!(sample_text_line("é λ", 3, 3, false), vec!['é', ' ', 'λ']);
+    }
+
+    fn encoded_cframe(character: u8, background: [u8; 3]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&[character, 10, 20, 30]);
+        data.push(cascii_core_view::CFRAME_EXT_FLAG_HAS_BG);
+        data.extend_from_slice(&background);
+        data
+    }
+
+    fn full_cframe_pack(frames: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"CFPK");
+        data.extend_from_slice(&1_u32.to_le_bytes());
+        data.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+        for frame in frames {
+            data.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+            data.extend_from_slice(frame);
+        }
+        data
+    }
+
+    #[test]
+    fn decodes_cascii_studio_full_cframe_packs() {
+        let data = full_cframe_pack(&[
+            encoded_cframe(b'A', [40, 50, 60]),
+            encoded_cframe(b'B', [70, 80, 90]),
+        ]);
+
+        let frames = frames_from_binary_data(&data, true).unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[0].content, "A\n");
+        assert_eq!(frames[1].content, "B\n");
+        assert_eq!(frames[0].cframe.as_ref().unwrap().bg_rgb_at(0, 0), Some((40, 50, 60)));
+        assert_eq!(frames[1].cframe.as_ref().unwrap().bg_rgb_at(0, 0), Some((70, 80, 90)));
+    }
+
+    #[test]
+    fn rejects_truncated_cascii_studio_full_cframe_packs() {
+        let mut data = full_cframe_pack(&[encoded_cframe(b'A', [40, 50, 60])]);
+        data.pop();
+
+        assert!(frames_from_binary_data(&data, true).is_err());
+    }
+
+    #[test]
+    fn saved_binary_files_are_discovered_for_named_playback() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("studio-export.bin");
+        let library_path = temp.path().join("library");
+        fs::write(&source, full_cframe_pack(&[encoded_cframe(b'A', [1, 2, 3])])).unwrap();
+        library::save(&source, "demo", &library_path).unwrap();
+
+        let saved = library::resolve(Path::new("demo"), &library_path);
+        let binary = find_standalone_binary(&saved).unwrap().unwrap();
+        let frames = load_packed_frames(&binary, true).unwrap();
+
+        assert_eq!(binary.file_name().unwrap(), "studio-export.bin");
+        assert_eq!(frames[0].content, "A\n");
     }
 
     #[test]

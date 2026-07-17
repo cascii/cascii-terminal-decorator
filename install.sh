@@ -14,11 +14,20 @@ if [ ! -f "$SOURCE" ]; then
 fi
 
 echo "Installing ${BINARY_NAME} to ${INSTALL_DIR}..."
+if [ ! -d "$INSTALL_DIR" ]; then
+    if ! mkdir -p "$INSTALL_DIR" 2>/dev/null; then
+        echo "Need sudo to create ${INSTALL_DIR}"
+        sudo install -d -m 755 "$INSTALL_DIR"
+    fi
+fi
+
 if [ -w "$INSTALL_DIR" ]; then
     install -m 755 "$SOURCE" "${INSTALL_DIR}/${BINARY_NAME}"
 else
     echo "Need sudo to write to ${INSTALL_DIR}"
     sudo install -m 755 "$SOURCE" "${INSTALL_DIR}/${BINARY_NAME}"
 fi
+
+"${INSTALL_DIR}/${BINARY_NAME}" config init
 
 echo "Done. You can now run: ${BINARY_NAME} /path-to-frames-folder"

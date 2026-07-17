@@ -26,3 +26,4 @@ eth/
 .ssmver/
 .docs/
 .temp/
+.claude/
