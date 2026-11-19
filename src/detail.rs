@@ -46,6 +46,23 @@ impl Detail {
         *self = Self::Width(next.map_or(current, |v| v.columns));
     }
 
+    pub fn next_curve(self) -> Self {
+        match self {
+            Self::Transition(Curve::Linear, dir) => Self::Transition(Curve::Exponential, dir),
+            Self::Transition(Curve::Exponential, dir) => Self::Transition(Curve::Logarithmic, dir),
+            Self::Transition(Curve::Logarithmic, dir) => Self::Transition(Curve::Linear, dir),
+            _ => Self::Transition(Curve::Linear, Direction::Down),
+        }
+    }
+
+    pub fn reverse(self) -> Self {
+        match self {
+            Self::Transition(curve, Direction::Up) => Self::Transition(curve, Direction::Down),
+            Self::Transition(curve, Direction::Down) => Self::Transition(curve, Direction::Up),
+            mode => mode,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",

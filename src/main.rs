@@ -541,7 +541,8 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
     let mut needs_redraw = true;
     let mut sync_audio = true;
     let mut next_tick = Instant::now() + frame_duration(&controller);
-    let mut resume_after_seek = false;
+    let mut clock_before_seek = None;
+    let mut reset_clock = true;
     let project_colors = display.colors.clone();
     let mut cached = None;
 
@@ -570,6 +571,11 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
             }
             sync_audio = false;
         }
+        if reset_clock {
+            // A network fetch or decoder seek can delay the first visible frame.
+            next_tick = Instant::now() + frame_duration(&controller);
+            reset_clock = false;
+        }
 
         let wait = if controller.is_playing() { next_tick.saturating_duration_since(Instant::now()) } else { Duration::from_millis(250) };
         if event::poll(wait)? {
@@ -582,11 +588,12 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
                             KeyCode::Char(c) if c.is_ascii_digit() && entry.len() < 12 => entry.push(c),
                             KeyCode::Backspace => { entry.pop(); }
                             KeyCode::Esc | KeyCode::Enter => {
+                                controller = clock_before_seek.take().expect("seek prompt saves the controller");
                                 if key.code == KeyCode::Enter && let Ok(target) = entry.parse::<usize>() {
+                                    if controller.state() == AnimationState::Finished { controller.stop(); }
                                     controller.set_current_frame(target.saturating_sub(1));
                                 }
                                 display.seek_input = None;
-                                if resume_after_seek { controller.play(); }
                                 sync_audio = true;
                             }
                             _ => {}
@@ -603,13 +610,7 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
                                 sync_audio = true;
                             }
                             KeyCode::Char('g') => {
-                                resume_after_seek = controller.is_playing();
-                                if controller.state() == AnimationState::Finished {
-                                    // The finished state otherwise rewinds to the range start on replay.
-                                    let current = controller.current_frame();
-                                    controller.stop();
-                                    controller.set_current_frame(current);
-                                }
+                                clock_before_seek = Some(controller.clone());
                                 controller.pause();
                                 display.seek_input = Some(String::new());
                                 sync_audio = true;
@@ -625,6 +626,8 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
                             }
                             KeyCode::Char('a') => { detail = Detail::Auto; display.fit_to_terminal = true; }
                             KeyCode::Char('p') => detail = Detail::Authored,
+                            KeyCode::Char('t') if frames.manifest().is_some() => detail = detail.next_curve(),
+                            KeyCode::Char('r') => detail = detail.reverse(),
                             KeyCode::Char('[' | ']') => {
                                 if let (Some(manifest), Some((columns, _, _))) = (frames.manifest(), display.grid) {
                                     detail.step(manifest, columns, key.code == KeyCode::Char(']'));
@@ -652,13 +655,13 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
                             _ => {}
                         }
                     }
-                    if sync_audio { next_tick = Instant::now() + frame_duration(&controller); }
+                    if sync_audio { reset_clock = true; }
                 }
                 _ => {}
             }
         }
 
-        if controller.is_playing() && Instant::now() >= next_tick {
+        if !reset_clock && controller.is_playing() && Instant::now() >= next_tick {
             let duration = frame_duration(&controller);
             let ticks_due = (1 + Instant::now().duration_since(next_tick).as_nanos() / duration.as_nanos()).min(u32::MAX as u128) as u32;
             let crossed_end = u64::from(ticks_due) > (controller.range_frames().1 - controller.current_frame()) as u64;

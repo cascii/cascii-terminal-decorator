@@ -250,6 +250,7 @@ Default locations follow each operating system's conventions:
 | `l`              | Toggle loop / once                |
 | `[` / `]`        | Previous / next generated width    |
 | `a` / `p`        | Automatic fit / authored column map |
+| `t` / `r`        | Cycle detail curves / reverse the active transition |
 | `g`, digits, `Enter` | Go to a one-based frame within the active range. `Esc` cancels |
 | `c`              | Cycle monochrome, project palette and available per-cell color |
 | `m`              | Mute / unmute audio |
