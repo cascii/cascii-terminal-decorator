@@ -64,7 +64,7 @@ casciit /path/to/family-guy_cframes.bin --color
 casciit save /path/to/family-guy_cframes.bin family-guy-binary
 casciit play family-guy-binary --color
 
-# Play frames in current directory (default 24 FPS, looping)
+# Play frames in current directory (default 30 FPS, looping)
 casciit .
 
 # Play frames in a specific directory at 30 FPS
@@ -97,8 +97,8 @@ frames or packed binary to confirm that the content is readable. When a saved
 item contains one `.bin` or `.cframes` file and no loose frames, that binary is
 selected automatically.
 
-Binary blobs do not contain playback FPS metadata, so they use 24 FPS by
-default. Pass `--fps` to override it.
+Binary blobs do not contain playback FPS metadata, so they use the configured
+default FPS. Pass `--fps` to override it for one playback.
 
 Or via `cargo run`:
 
@@ -121,18 +121,93 @@ Change the saved-animation library (relative paths are converted to absolute pat
 casciit config set save-path /path/to/animation-library
 ```
 
+Choose whether playback uses per-cell color by default:
+
+```bash
+casciit config set color on
+casciit config set color off
+```
+
+The default is color (`on`). For one playback, `--color` forces color and
+`--no-color` forces monochrome without changing the saved preference.
+Legacy settings created before this default changed are migrated to color-on
+once; a subsequent explicit `color off` choice is preserved.
+
+Set the default playback speed:
+
+```bash
+casciit config set fps 30
+```
+
+The FPS precedence is `--fps`, then a project’s `details.toml`, then this saved
+default. FPS must be a positive whole number.
+
+Choose whether frames fit within the terminal by default:
+
+```bash
+casciit config set fit on
+casciit config set fit off
+```
+
+Fit defaults to `on`. For one playback, `--fit` forces fitting and `--no-fit`
+keeps native frame dimensions without changing the saved preference.
+
+Configure looping and the information bar:
+
+```bash
+casciit config set loop on
+casciit config set loop off
+casciit config set hide-bar on
+casciit config set hide-bar off
+```
+
+Looping defaults to `on`, and hiding the entire bar defaults to `off`.
+`--loop`/`--once` and `--show-bar`/`--hide-bar` override those settings for one
+playback.
+
+Each bar field can also be shown or hidden independently:
+
+```bash
+casciit config set bar frame off
+casciit config set bar fps off
+casciit config set bar controls off
+```
+
+Available fields are `frame`, `range`, `state`, `fps`, `loop`, `fit`, `color`,
+`audio`, and `controls`. `on` means visible and `off` means hidden. Every field
+is visible by default when the bar itself is not hidden.
+
 `settings.json` contains:
 
 ```json
 {
   "name": "casciit",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "binary_path": "/usr/local/bin/casciit",
-  "save_path": "/home/user/.local/share/casciit/animations"
+  "save_path": "/home/user/.local/share/casciit/animations",
+  "color": true,
+  "fps": 30,
+  "fit": true,
+  "loop": true,
+  "hide_bar": false,
+  "bar": {
+    "frame": true,
+    "range": true,
+    "state": true,
+    "fps": true,
+    "loop": true,
+    "fit": true,
+    "color": true,
+    "audio": true,
+    "controls": true
+  },
+  "schema_version": 2
 }
 ```
 
-`name`, `version`, and `binary_path` are refreshed automatically when the app is upgraded or moved. A custom `save_path` is preserved.
+`name`, `version`, and `binary_path` are refreshed automatically when the app
+is upgraded or moved. User-configurable playback and bar preferences are
+preserved.
 
 Default locations follow each operating system's conventions:
 

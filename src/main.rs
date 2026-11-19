@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use cascii_core_view::{AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, parse_cframe, parse_cframe_text, parse_packed_cframes};
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
@@ -74,6 +74,60 @@ enum ConfigSetting {
     SavePath {
         path: PathBuf,
     },
+
+    /// Enable or disable colored rendering by default
+    Color {
+        value: OnOff,
+    },
+
+    /// Set the default playback speed in frames per second
+    Fps {
+        /// Positive whole-number frame rate
+        #[arg(value_parser = parse_positive_fps)]
+        fps: u32,
+    },
+
+    /// Enable or disable fit-to-terminal rendering by default
+    Fit {
+        value: OnOff,
+    },
+
+    /// Enable or disable looping by default
+    Loop {
+        value: OnOff,
+    },
+
+    /// Hide or show the entire information bar by default
+    HideBar {
+        value: OnOff,
+    },
+
+    /// Show or hide one field in the information bar
+    Bar {
+        field: BarField,
+        value: OnOff,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OnOff {
+    #[value(alias = "true", alias = "yes")]
+    On,
+    #[value(alias = "false", alias = "no")]
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BarField {
+    Frame,
+    Range,
+    State,
+    Fps,
+    Loop,
+    Fit,
+    Color,
+    Audio,
+    Controls,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -82,17 +136,25 @@ struct PlaybackArgs {
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Starting playback FPS (overrides details.toml)
-    #[arg(long)]
+    /// Playback FPS (overrides details.toml and settings)
+    #[arg(long, value_parser = parse_positive_fps)]
     fps: Option<u32>,
 
     /// Play once instead of looping
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "looping")]
     once: bool,
 
+    /// Loop this playback
+    #[arg(long = "loop", default_value_t = false, conflicts_with = "once")]
+    looping: bool,
+
     /// Enable colored rendering from .cframe data
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "no_color")]
     color: bool,
+
+    /// Disable colored rendering for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "color")]
+    no_color: bool,
 
     /// Packed multi-frame blob to play (relative paths use PATH)
     #[arg(long, value_name = "FILE")]
@@ -106,9 +168,21 @@ struct PlaybackArgs {
     #[arg(long, value_name = "POSITION")]
     end: Option<f64>,
 
+    /// Fit frames within the terminal for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "no_fit")]
+    fit: bool,
+
     /// Preserve native frame dimensions and crop content that exceeds the terminal
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "fit")]
     no_fit: bool,
+
+    /// Show the information bar for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "hide_bar")]
+    show_bar: bool,
+
+    /// Hide the information bar for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "show_bar")]
+    hide_bar: bool,
 }
 
 struct TerminalGuard {
@@ -120,6 +194,8 @@ struct DisplayState {
     has_any_color: bool,
     has_audio: bool,
     fit_to_terminal: bool,
+    hide_bar: bool,
+    bar: settings::BarSettings,
 }
 
 impl TerminalGuard {
@@ -211,15 +287,51 @@ fn run_config(args: ConfigArgs, app_paths: &settings::AppPaths, app_settings: &m
         ConfigCommand::Path => {
             println!("{}", app_paths.settings_file.display());
         }
-        ConfigCommand::Set {setting: ConfigSetting::SavePath {path}} => {
-            settings::set_save_path(app_paths, app_settings, &path)?;
-            println!("Save path set to {}", app_settings.save_path.display());
+        ConfigCommand::Set {setting} => match setting {
+            ConfigSetting::SavePath {path} => {
+                settings::set_save_path(app_paths, app_settings, &path)?;
+                println!("Save path set to {}", app_settings.save_path.display());
+            }
+            ConfigSetting::Color {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_color(app_paths, app_settings, enabled)?;
+                println!("Default color rendering set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::Fps {fps} => {
+                settings::set_fps(app_paths, app_settings, fps)?;
+                println!("Default playback speed set to {fps} FPS");
+            }
+            ConfigSetting::Fit {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_fit(app_paths, app_settings, enabled)?;
+                println!("Default fit-to-terminal rendering set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::Loop {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_loop(app_paths, app_settings, enabled)?;
+                println!("Default looping set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::HideBar {value} => {
+                let hidden = matches!(value, OnOff::On);
+                settings::set_hide_bar(app_paths, app_settings, hidden)?;
+                println!("Default information bar hiding set to {}", if hidden {"on"} else {"off"});
+            }
+            ConfigSetting::Bar {field, value} => {
+                let visible = matches!(value, OnOff::On);
+                set_bar_field(&mut app_settings.bar, field, visible);
+                settings::write(app_paths, app_settings)?;
+                println!("Information bar field {} set to {}", field_name(field), if visible {"visible"} else {"hidden"});
+            }
         }
     }
     Ok(())
 }
 
 fn play(mut args: PlaybackArgs, app_settings: &settings::Settings) -> Result<()> {
+    let use_color = playback_uses_color(&args, app_settings);
+    let fit_to_terminal = playback_fits_terminal(&args, app_settings);
+    let loop_playback = playback_loops(&args, app_settings);
+    let hide_bar = playback_hides_bar(&args, app_settings);
     args.path = library::resolve(&args.path, &app_settings.save_path);
     let direct_binary = args.path.is_file().then(|| args.path.clone());
     let discovered_binary = if direct_binary.is_none() && args.packed.is_none() && args.path.is_dir() {
@@ -232,31 +344,111 @@ fn play(mut args: PlaybackArgs, app_settings: &settings::Settings) -> Result<()>
     let details = load_project_details(details_directory);
     let colors = details.frame_colors();
     let has_audio = details.audio.unwrap_or(false);
-    let fps = args.fps.unwrap_or_else(|| details.fps.unwrap_or(24));
+    let fps = playback_fps(args.fps, details.fps, app_settings);
 
     let frames = if let Some(packed_path) = args.packed.as_ref() {
         if !args.path.is_dir() {
             bail!("The playback path must be a directory when --packed is used");
         }
-        load_packed_frames(&resolve_packed_path(&args.path, packed_path), args.color)?
+        load_packed_frames(&resolve_packed_path(&args.path, packed_path), use_color)?
     } else if let Some(binary_path) = binary_path {
-        load_packed_frames(&binary_path, args.color)?
+        load_packed_frames(&binary_path, use_color)?
     } else {
-        load_frames(&args.path, args.color)?
+        load_frames(&args.path, use_color)?
     };
     let has_any_color = frames.iter().any(Frame::has_color);
 
     let mut controller = AnimationController::new(fps);
     controller.set_frame_count(frames.len());
-    if args.once {
+    if !loop_playback {
         controller.set_loop_mode(LoopMode::Once);
     }
     configure_range(&mut controller, args.start, args.end)?;
     controller.play();
 
-    let display = DisplayState {colors, has_any_color, has_audio, fit_to_terminal: !args.no_fit};
+    let display = DisplayState {colors, has_any_color, has_audio, fit_to_terminal, hide_bar, bar: app_settings.bar.clone()};
 
     run_player(frames, controller, display)
+}
+
+fn playback_uses_color(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.color {
+        true
+    } else if args.no_color {
+        false
+    } else {
+        settings.color
+    }
+}
+
+fn playback_fps(requested_fps: Option<u32>, project_fps: Option<u32>, settings: &settings::Settings) -> u32 {
+    requested_fps.or(project_fps).unwrap_or(settings.fps)
+}
+
+fn playback_fits_terminal(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.fit {
+        true
+    } else if args.no_fit {
+        false
+    } else {
+        settings.fit
+    }
+}
+
+fn playback_loops(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.looping {
+        true
+    } else if args.once {
+        false
+    } else {
+        settings.loop_playback
+    }
+}
+
+fn playback_hides_bar(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.hide_bar {
+        true
+    } else if args.show_bar {
+        false
+    } else {
+        settings.hide_bar
+    }
+}
+
+fn set_bar_field(bar: &mut settings::BarSettings, field: BarField, visible: bool) {
+    match field {
+        BarField::Frame => bar.frame = visible,
+        BarField::Range => bar.range = visible,
+        BarField::State => bar.state = visible,
+        BarField::Fps => bar.fps = visible,
+        BarField::Loop => bar.loop_mode = visible,
+        BarField::Fit => bar.fit = visible,
+        BarField::Color => bar.color = visible,
+        BarField::Audio => bar.audio = visible,
+        BarField::Controls => bar.controls = visible,
+    }
+}
+
+fn field_name(field: BarField) -> &'static str {
+    match field {
+        BarField::Frame => "frame",
+        BarField::Range => "range",
+        BarField::State => "state",
+        BarField::Fps => "fps",
+        BarField::Loop => "loop",
+        BarField::Fit => "fit",
+        BarField::Color => "color",
+        BarField::Audio => "audio",
+        BarField::Controls => "controls",
+    }
+}
+
+fn parse_positive_fps(value: &str) -> std::result::Result<u32, String> {
+    let fps = value.parse::<u32>().map_err(|_| "FPS must be a positive whole number".to_string())?;
+    if fps == 0 {
+        return Err("FPS must be at least 1".to_string());
+    }
+    Ok(fps)
 }
 
 fn resolve_packed_path(directory: &Path, packed_path: &Path) -> PathBuf {
@@ -414,7 +606,8 @@ fn advance_controller(controller: &mut AnimationController, ticks: u32) {
 fn render_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, controller: &AnimationController, frame_index: usize, total_frames: usize, display: &DisplayState) -> Result<()> {
     let terminal_size = terminal::size().context("reading terminal size")?;
     let (term_width, term_height) = terminal_size;
-    let drawable_height = term_height.saturating_sub(1) as usize;
+    let bar_height = if display.hide_bar {0} else {1};
+    let drawable_height = term_height.saturating_sub(bar_height) as usize;
     let term_width_usize = term_width as usize;
 
     let (bg_r, bg_g, bg_b) = display.colors.background;
@@ -433,7 +626,9 @@ fn render_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, controller: &Anim
         draw_text_frame(stdout, frame, term_width_usize, drawable_height, display)?;
     }
 
-    draw_status_line(stdout, controller, frame_index, total_frames, terminal_size, display)?;
+    if !display.hide_bar {
+        draw_status_line(stdout, controller, frame_index, total_frames, terminal_size, display)?;
+    }
     Ok(())
 }
 
@@ -551,18 +746,50 @@ fn source_index(target_index: usize, target_len: usize, source_len: usize, fit_t
 
 fn draw_status_line(stdout: &mut BufWriter<Stdout>, controller: &AnimationController, frame_index: usize, total_frames: usize, terminal_size: (u16, u16), display: &DisplayState) -> Result<()> {
     let (term_width, term_height) = terminal_size;
+    let status = status_text(controller, frame_index, total_frames, display);
+    let status_line = truncate_to_width(&status, term_width as usize);
+    let y = term_height.saturating_sub(1);
+    let clear_line = " ".repeat(term_width as usize);
+    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(clear_line), MoveTo(0, y), Print(status_line), ResetColor).context("drawing status line")?;
+    Ok(())
+}
+
+fn status_text(controller: &AnimationController, frame_index: usize, total_frames: usize, display: &DisplayState) -> String {
     let playback_state = format!("{:?}", controller.state()).to_lowercase();
     let loop_mode = match controller.loop_mode() {
         LoopMode::Loop => "loop",
         LoopMode::Once => "once",
     };
     let (range_start, range_end) = controller.range_frames();
-    let status = format!("frame {}/{} | range {}-{} | {} | {} fps | {} | fit:{} | color:{} | audio:{} | [space] play/pause [←/→] step [home/end] range [+/-] fps [f] fit [l] loop [q] quit", frame_index + 1, total_frames, range_start + 1, range_end + 1, playback_state, controller.fps(), loop_mode, if display.fit_to_terminal {"on"} else {"off"}, if display.has_any_color {"on"} else {"off"}, if display.has_audio {"yes"} else {"no"});
-    let status_line = truncate_to_width(&status, term_width as usize);
-    let y = term_height.saturating_sub(1);
-    let clear_line = " ".repeat(term_width as usize);
-    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(clear_line), MoveTo(0, y), Print(status_line), ResetColor).context("drawing status line")?;
-    Ok(())
+    let mut fields = Vec::new();
+    if display.bar.frame {
+        fields.push(format!("frame {}/{}", frame_index + 1, total_frames));
+    }
+    if display.bar.range {
+        fields.push(format!("range {}-{}", range_start + 1, range_end + 1));
+    }
+    if display.bar.state {
+        fields.push(playback_state);
+    }
+    if display.bar.fps {
+        fields.push(format!("{} fps", controller.fps()));
+    }
+    if display.bar.loop_mode {
+        fields.push(loop_mode.to_string());
+    }
+    if display.bar.fit {
+        fields.push(format!("fit:{}", if display.fit_to_terminal {"on"} else {"off"}));
+    }
+    if display.bar.color {
+        fields.push(format!("color:{}", if display.has_any_color {"on"} else {"off"}));
+    }
+    if display.bar.audio {
+        fields.push(format!("audio:{}", if display.has_audio {"yes"} else {"no"}));
+    }
+    if display.bar.controls {
+        fields.push("[space] play/pause [←/→] step [home/end] range [+/-] fps [f] fit [l] loop [q] quit".to_string());
+    }
+    fields.join(" | ")
 }
 
 fn truncate_to_width(input: &str, width: usize) -> String {
@@ -579,7 +806,7 @@ fn load_project_details(directory: &Path) -> ProjectDetails {
 }
 
 fn load_frames(directory: &Path, use_color: bool) -> Result<Vec<Frame>> {
-    // Prefer .txt files when available (monochrome by default).
+    // Prefer .txt files as the text source when available.
     let txt_paths = collect_frame_paths(directory, "txt", true)?;
     if !txt_paths.is_empty() {
         let mut frames = Vec::with_capacity(txt_paths.len());
@@ -841,6 +1068,195 @@ mod tests {
         let cli = Cli::try_parse_from(["casciit", "config", "set", "save-path", "library"]).unwrap();
 
         assert!(matches!(cli.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::SavePath {path}})})) if path == PathBuf::from("library")));
+    }
+
+    #[test]
+    fn parses_the_default_color_setting_command() {
+        let enabled = Cli::try_parse_from(["casciit", "config", "set", "color", "on"]).unwrap();
+        let disabled = Cli::try_parse_from(["casciit", "config", "set", "color", "off"]).unwrap();
+
+        assert!(matches!(enabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Color {value: OnOff::On}})}))));
+        assert!(matches!(disabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Color {value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn parses_the_default_fps_setting_command() {
+        let cli = Cli::try_parse_from(["casciit", "config", "set", "fps", "30"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fps {fps: 30}})}))));
+        assert!(Cli::try_parse_from(["casciit", "config", "set", "fps", "0"]).is_err());
+        assert!(Cli::try_parse_from(["casciit", "frames", "--fps", "0"]).is_err());
+    }
+
+    #[test]
+    fn parses_the_default_fit_setting_command() {
+        let enabled = Cli::try_parse_from(["casciit", "config", "set", "fit", "on"]).unwrap();
+        let disabled = Cli::try_parse_from(["casciit", "config", "set", "fit", "off"]).unwrap();
+
+        assert!(matches!(enabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fit {value: OnOff::On}})}))));
+        assert!(matches!(disabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fit {value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn parses_loop_and_information_bar_setting_commands() {
+        let looping = Cli::try_parse_from(["casciit", "config", "set", "loop", "off"]).unwrap();
+        let hidden = Cli::try_parse_from(["casciit", "config", "set", "hide-bar", "on"]).unwrap();
+        let frame = Cli::try_parse_from(["casciit", "config", "set", "bar", "frame", "off"]).unwrap();
+
+        assert!(matches!(looping.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Loop {value: OnOff::Off}})}))));
+        assert!(matches!(hidden.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::HideBar {value: OnOff::On}})}))));
+        assert!(matches!(frame.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Bar {field: BarField::Frame, value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn playback_uses_the_color_setting_unless_explicitly_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let color_args = Cli::try_parse_from(["casciit", "frames", "--color"]).unwrap().playback;
+        let monochrome_args = Cli::try_parse_from(["casciit", "frames", "--no-color"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: true,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_uses_color(&default_args, &app_settings));
+        assert!(!playback_uses_color(&monochrome_args, &app_settings));
+        app_settings.color = false;
+        assert!(!playback_uses_color(&default_args, &app_settings));
+        assert!(playback_uses_color(&color_args, &app_settings));
+    }
+
+    #[test]
+    fn playback_fps_prefers_cli_then_project_then_settings() {
+        let app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: false,
+            fps: 30,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert_eq!(playback_fps(Some(60), Some(24), &app_settings), 60);
+        assert_eq!(playback_fps(None, Some(24), &app_settings), 24);
+        assert_eq!(playback_fps(None, None, &app_settings), 30);
+    }
+
+    #[test]
+    fn playback_uses_the_fit_setting_unless_explicitly_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let fit_args = Cli::try_parse_from(["casciit", "frames", "--fit"]).unwrap().playback;
+        let native_args = Cli::try_parse_from(["casciit", "frames", "--no-fit"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: false,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_fits_terminal(&default_args, &app_settings));
+        assert!(!playback_fits_terminal(&native_args, &app_settings));
+        app_settings.fit = false;
+        assert!(!playback_fits_terminal(&default_args, &app_settings));
+        assert!(playback_fits_terminal(&fit_args, &app_settings));
+        assert!(Cli::try_parse_from(["casciit", "frames", "--fit", "--no-fit"]).is_err());
+    }
+
+    #[test]
+    fn playback_uses_loop_and_bar_settings_unless_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let once_args = Cli::try_parse_from(["casciit", "frames", "--once"]).unwrap().playback;
+        let loop_args = Cli::try_parse_from(["casciit", "frames", "--loop"]).unwrap().playback;
+        let hidden_args = Cli::try_parse_from(["casciit", "frames", "--hide-bar"]).unwrap().playback;
+        let shown_args = Cli::try_parse_from(["casciit", "frames", "--show-bar"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: true,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_loops(&default_args, &app_settings));
+        assert!(!playback_loops(&once_args, &app_settings));
+        assert!(!playback_hides_bar(&default_args, &app_settings));
+        assert!(playback_hides_bar(&hidden_args, &app_settings));
+        app_settings.loop_playback = false;
+        app_settings.hide_bar = true;
+        assert!(!playback_loops(&default_args, &app_settings));
+        assert!(playback_loops(&loop_args, &app_settings));
+        assert!(playback_hides_bar(&default_args, &app_settings));
+        assert!(!playback_hides_bar(&shown_args, &app_settings));
+        assert!(Cli::try_parse_from(["casciit", "frames", "--once", "--loop"]).is_err());
+        assert!(Cli::try_parse_from(["casciit", "frames", "--show-bar", "--hide-bar"]).is_err());
+    }
+
+    #[test]
+    fn every_information_bar_field_can_be_hidden_independently() {
+        let mut bar = settings::BarSettings::default();
+        for field in [BarField::Frame, BarField::Range, BarField::State, BarField::Fps, BarField::Loop, BarField::Fit, BarField::Color, BarField::Audio, BarField::Controls] {
+            set_bar_field(&mut bar, field, false);
+        }
+
+        assert_eq!(bar, settings::BarSettings {frame: false, range: false, state: false, fps: false, loop_mode: false, fit: false, color: false, audio: false, controls: false});
+    }
+
+    #[test]
+    fn status_text_only_contains_visible_bar_fields() {
+        let mut controller = AnimationController::new(30);
+        controller.set_frame_count(2);
+        controller.play();
+        let mut display = DisplayState {
+            colors: ProjectDetails::default().frame_colors(),
+            has_any_color: true,
+            has_audio: false,
+            fit_to_terminal: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+        };
+
+        let complete = status_text(&controller, 0, 2, &display);
+        assert!(complete.contains("frame 1/2"));
+        assert!(complete.contains("30 fps"));
+        assert!(complete.contains("audio:no"));
+        display.bar.frame = false;
+        display.bar.fps = false;
+        display.bar.audio = false;
+        let filtered = status_text(&controller, 0, 2, &display);
+        assert!(!filtered.contains("frame 1/2"));
+        assert!(!filtered.contains("30 fps"));
+        assert!(!filtered.contains("audio:no"));
+    }
+
+    #[test]
+    fn rejects_conflicting_color_overrides() {
+        assert!(Cli::try_parse_from(["casciit", "frames", "--color", "--no-color"]).is_err());
     }
 
     #[test]
