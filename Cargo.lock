@@ -158,7 +158,7 @@ checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 [[package]]
 name = "cascii-core-view"
 version = "0.8.0"
-source = "git+https://github.com/cascii/cascii-core-view.git?rev=87a173967b715a29f657125fcd27ed03d2e8fbe4#87a173967b715a29f657125fcd27ed03d2e8fbe4"
+source = "git+https://github.com/cascii/cascii-core-view.git?rev=d48476fda8e3cb2c2ff79480400bceccdf1e58e5#d48476fda8e3cb2c2ff79480400bceccdf1e58e5"
 dependencies = [
  "serde",
  "serde_json",
