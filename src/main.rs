@@ -11,7 +11,9 @@ use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, queue};
+use crossterm::{SynchronizedUpdate, execute, queue};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 mod audio;
 mod detail;
@@ -545,6 +547,7 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
     let mut reset_clock = true;
     let project_colors = display.colors.clone();
     let mut cached = None;
+    let mut previous_layout = None;
 
     loop {
         if needs_redraw {
@@ -559,8 +562,10 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
             }
             let frame = &cached.as_ref().unwrap().1;
             display.grid = (columns > 0).then(|| (columns, frame.dimensions().1 as u32, detail));
-            render_frame(&mut terminal.stdout, frame, &controller, index, frames.count(), &display, size)?;
-            terminal.stdout.flush().context("flushing terminal output")?;
+            let layout = terminal.stdout.sync_update(|out| {
+                render_frame(out, frame, &controller, &display, size, previous_layout)
+            }).context("presenting terminal frame")??;
+            previous_layout = Some(layout);
             needs_redraw = false;
         }
         if sync_audio {
@@ -580,7 +585,10 @@ fn run_player(mut frames: Frames, mut controller: AnimationController, mut displ
         let wait = if controller.is_playing() { next_tick.saturating_duration_since(Instant::now()) } else { Duration::from_millis(250) };
         if event::poll(wait)? {
             match event::read()? {
-                Event::Resize(_, _) => needs_redraw = true,
+                Event::Resize(_, _) => {
+                    previous_layout = None;
+                    needs_redraw = true;
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     needs_redraw = true;
                     if let Some(entry) = &mut display.seek_input {
@@ -706,35 +714,74 @@ fn advance_controller(controller: &mut AnimationController, ticks: u32) {
     }
 }
 
-fn render_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, controller: &AnimationController, frame_index: usize, total_frames: usize, display: &DisplayState, terminal_size: (u16, u16)) -> Result<()> {
-    let (term_width, term_height) = terminal_size;
-    let bar_height = if display.hide_bar && display.seek_input.is_none() {0} else {1};
-    let drawable_height = term_height.saturating_sub(bar_height) as usize;
-    let term_width_usize = term_width as usize;
-
-    let (bg_r, bg_g, bg_b) = display.colors.background;
-    queue!(stdout, MoveTo(0, 0), SetBackgroundColor(Color::Rgb {r: bg_r, g: bg_g, b: bg_b}), Clear(ClearType::All)).context("clearing frame")?;
-
-    if let Some(cframe) = frame.cframe.as_ref() {
-        let frame_width = cframe.width as usize;
-        let frame_height = cframe.height as usize;
-        let (draw_width, draw_height) = drawable_dimensions(frame_width, frame_height, term_width_usize, drawable_height, display.fit_to_terminal);
-
-        let x_offset = term_width_usize.saturating_sub(draw_width) / 2;
-        let y_offset = drawable_height.saturating_sub(draw_height) / 2;
-
-        draw_cframe(stdout, cframe, draw_width, draw_height, x_offset, y_offset, display)?;
-    } else {
-        draw_text_frame(stdout, frame, term_width_usize, drawable_height, display)?;
-    }
-
-    if !display.hide_bar || display.seek_input.is_some() {
-        draw_status_line(stdout, controller, frame_index, total_frames, terminal_size, display)?;
-    }
-    Ok(())
+#[derive(Clone, Copy, PartialEq)]
+struct FrameLayout {
+    terminal_width: usize,
+    drawable_rows: usize,
+    width: usize,
+    height: usize,
+    background: Color,
 }
 
-fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrameData, draw_width: usize, draw_height: usize, x_offset: usize, y_offset: usize, display: &DisplayState) -> Result<()> {
+impl FrameLayout {
+    fn left(self) -> usize { (self.terminal_width - self.width) / 2 }
+    fn top(self) -> usize { (self.drawable_rows - self.height) / 2 }
+
+    // Repaint only the letterbox area, including cells exposed by a smaller frame.
+    // The new picture will overwrite the old one directly, even without DEC 2026.
+    fn paint_margins(self, out: &mut impl Write) -> io::Result<()> {
+        let left = self.left();
+        let right = left + self.width;
+        let top = self.top();
+        let spaces = " ".repeat(self.terminal_width);
+        for row in 0..self.drawable_rows {
+            if row < top || row >= top + self.height {
+                queue!(out, MoveTo(0, row as u16), Print(&spaces))?;
+            } else {
+                if left > 0 {
+                    queue!(out, MoveTo(0, row as u16), Print(&spaces[..left]))?;
+                }
+                if right < self.terminal_width {
+                    queue!(out, MoveTo(right as u16, row as u16), Print(&spaces[right..]))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn render_frame(stdout: &mut impl Write, frame: &Frame, controller: &AnimationController, display: &DisplayState, terminal_size: (u16, u16), previous: Option<FrameLayout>) -> Result<FrameLayout> {
+    let show_bar = !display.hide_bar || display.seek_input.is_some();
+    let drawable_rows = usize::from(terminal_size.1.saturating_sub(u16::from(show_bar)));
+    let terminal_width = usize::from(terminal_size.0);
+    let (source_width, source_height) = match &frame.cframe {
+        Some(cframe) => (cframe.width as usize, cframe.height as usize),
+        None => (frame.content.lines().map(UnicodeWidthStr::width).max().unwrap_or(0), frame.content.lines().count()),
+    };
+    let (width, height) = drawable_dimensions(source_width, source_height, terminal_width, drawable_rows, display.fit_to_terminal);
+    let (r, g, b) = display.colors.background;
+    let layout = FrameLayout {terminal_width, drawable_rows, width, height, background: Color::Rgb {r, g, b}};
+
+    queue!(stdout, SetBackgroundColor(layout.background))?;
+    if previous != Some(layout) {
+        layout.paint_margins(stdout)?;
+    }
+    if let Some(cframe) = frame.cframe.as_ref() {
+        draw_cframe(stdout, cframe, layout, display)?;
+    } else {
+        draw_text_frame(stdout, frame, source_width, layout, display)?;
+    }
+    if show_bar && terminal_size.1 > 0 && terminal_width > 0 {
+        draw_status_line(stdout, controller, controller.current_frame(), controller.frame_count(), terminal_size, display)?;
+    }
+    Ok(layout)
+}
+
+fn draw_cframe(stdout: &mut impl Write, cframe: &cascii_core_view::CFrameData, layout: FrameLayout, display: &DisplayState) -> Result<()> {
+    let (draw_width, draw_height) = (layout.width, layout.height);
+    let (x_offset, y_offset) = (layout.left(), layout.top());
+    let mut active_background = display.colors.background;
+    let mut active_foreground = None;
     for row in 0..draw_height {
         let source_row = source_index(row, draw_height, cframe.height as usize, display.fit_to_terminal);
         queue!(stdout, MoveTo(x_offset as u16, (y_offset + row) as u16)).context("moving to colored row")?;
@@ -759,10 +806,14 @@ fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrame
                 col += 1;
             }
 
-            let (bg_r, bg_g, bg_b) = background;
-            queue!(stdout, SetBackgroundColor(Color::Rgb {r: bg_r, g: bg_g, b: bg_b})).context("setting colored run background")?;
-            if let Some((fg_r, fg_g, fg_b)) = foreground {
-                queue!(stdout, SetForegroundColor(Color::Rgb {r: fg_r, g: fg_g, b: fg_b})).context("setting colored run foreground")?;
+            if background != active_background {
+                let (r, g, b) = background;
+                queue!(stdout, SetBackgroundColor(Color::Rgb {r, g, b}))?;
+                active_background = background;
+            }
+            if foreground != active_foreground && let Some((r, g, b)) = foreground {
+                queue!(stdout, SetForegroundColor(Color::Rgb {r, g, b}))?;
+                active_foreground = foreground;
             }
             queue!(stdout, Print(run)).context("drawing colored run")?;
         }
@@ -770,44 +821,15 @@ fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrame
     Ok(())
 }
 
-fn draw_text_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, term_width: usize, drawable_height: usize, display: &DisplayState) -> Result<()> {
+fn draw_text_frame(stdout: &mut impl Write, frame: &Frame, source_width: usize, layout: FrameLayout, display: &DisplayState) -> Result<()> {
     let lines: Vec<&str> = frame.content.lines().collect();
-    let frame_height = lines.len();
-    let frame_width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
-    let (draw_width, draw_height) = drawable_dimensions(frame_width, frame_height, term_width, drawable_height, display.fit_to_terminal);
-
-    let x_offset = term_width.saturating_sub(draw_width) / 2;
-    let y_offset = drawable_height.saturating_sub(draw_height) / 2;
-
-    for row in 0..draw_height {
-        let source_row = source_index(row, draw_height, frame_height, display.fit_to_terminal);
-        let line = lines.get(source_row).copied().unwrap_or("");
-        let sampled_line = sample_text_line(line, frame_width, draw_width, display.fit_to_terminal);
-        let mut col = 0usize;
-
-        while col < draw_width {
-            if sampled_line[col] == ' ' {
-                col += 1;
-                continue;
-            }
-
-            let start_col = col;
-            let mut text = String::new();
-            while col < draw_width {
-                let sampled = sampled_line[col];
-                if sampled == ' ' {
-                    break;
-                }
-                text.push(sampled);
-                col += 1;
-            }
-
-            let (fg_r, fg_g, fg_b) = display.colors.foreground;
-            queue!(stdout, MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16), SetForegroundColor(Color::Rgb {r: fg_r, g: fg_g, b: fg_b}), Print(text))
-            .context("drawing text run")?;
-        }
+    let (r, g, b) = display.colors.foreground;
+    queue!(stdout, SetForegroundColor(Color::Rgb {r, g, b}))?;
+    for row in 0..layout.height {
+        let source_row = source_index(row, layout.height, lines.len(), display.fit_to_terminal);
+        let line = sample_text_line(lines[source_row], source_width, layout.width, display.fit_to_terminal);
+        queue!(stdout, MoveTo(layout.left() as u16, (layout.top() + row) as u16), Print(line)).context("drawing text row")?;
     }
-
     Ok(())
 }
 
@@ -815,12 +837,41 @@ fn printable(character: char) -> char {
     if character.is_control() { ' ' } else { character }
 }
 
-fn sample_text_line(line: &str, source_width: usize, draw_width: usize, fit_to_terminal: bool) -> Vec<char> {
-    let characters: Vec<char> = line.chars().collect();
-    (0..draw_width).map(|col| {
-            let source_col = source_index(col, draw_width, source_width, fit_to_terminal);
-            characters.get(source_col).copied().map(printable).unwrap_or(' ')
-        }).collect()
+fn sample_text_line(line: &str, source_width: usize, draw_width: usize, fit: bool) -> String {
+    if line.is_ascii() {
+        return (0..draw_width).map(|col| {
+            let source = source_index(col, draw_width, source_width, fit);
+            printable(char::from(line.as_bytes().get(source).copied().unwrap_or(b' ')))
+        }).collect();
+    }
+
+    // A text row must replace exactly its share of the screen, including any
+    // cells previously occupied by a wide glyph or now occupied by spaces.
+    let mut glyphs = line.graphemes(true);
+    let mut output = String::new();
+    let mut glyph = "";
+    let mut glyph_width = 0;
+    let mut source_end = 0;
+    let mut col = 0;
+    while col < draw_width {
+        let source = source_index(col, draw_width, source_width, fit);
+        while source >= source_end {
+            let Some(next) = glyphs.next() else {
+                output.push_str(&" ".repeat(draw_width - col));
+                return output;
+            };
+            glyph = if next.chars().any(char::is_control) { " " } else { next };
+            glyph_width = glyph.width();
+            source_end += glyph_width;
+        }
+        if glyph_width > draw_width - col {
+            output.push_str(&" ".repeat(draw_width - col));
+            break;
+        }
+        output.push_str(glyph);
+        col += glyph_width;
+    }
+    output
 }
 
 fn drawable_dimensions(frame_width: usize, frame_height: usize, max_width: usize, max_height: usize, fit_to_terminal: bool) -> (usize, usize) {
@@ -850,13 +901,13 @@ fn source_index(target_index: usize, target_len: usize, source_len: usize, fit_t
     (numerator / denominator) as usize
 }
 
-fn draw_status_line(stdout: &mut BufWriter<Stdout>, controller: &AnimationController, frame_index: usize, total_frames: usize, terminal_size: (u16, u16), display: &DisplayState) -> Result<()> {
+fn draw_status_line(stdout: &mut impl Write, controller: &AnimationController, frame_index: usize, total_frames: usize, terminal_size: (u16, u16), display: &DisplayState) -> Result<()> {
     let (term_width, term_height) = terminal_size;
     let status = status_text(controller, frame_index, total_frames, display);
     let status_line = truncate_to_width(&status, term_width as usize);
     let y = term_height.saturating_sub(1);
-    let clear_line = " ".repeat(term_width as usize);
-    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(clear_line), MoveTo(0, y), Print(status_line), ResetColor).context("drawing status line")?;
+    let padded = format!("{status_line:<width$}", width = usize::from(term_width));
+    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(padded), ResetColor).context("drawing status line")?;
     Ok(())
 }
 
@@ -1348,7 +1399,14 @@ mod tests {
 
     #[test]
     fn text_sampling_preserves_unicode_characters() {
-        assert_eq!(sample_text_line("é λ", 3, 3, false), vec!['é', ' ', 'λ']);
+        assert_eq!(sample_text_line("é λ", 3, 3, false), "é λ");
+    }
+
+    #[test]
+    fn text_rows_overwrite_spaces_and_preserve_terminal_cell_width() {
+        assert_eq!(sample_text_line("A", 4, 4, false), "A   ");
+        assert_eq!(sample_text_line("界e\u{301}", 4, 4, false), "界e\u{301} ");
+        assert_eq!(sample_text_line("a界", 3, 2, false), "a ");
     }
 
     fn load_packed_frames(path: &Path, color: bool) -> Result<Vec<Frame>> {

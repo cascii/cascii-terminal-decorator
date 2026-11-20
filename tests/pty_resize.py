@@ -30,7 +30,8 @@ def fixture(path):
     for frame in range(2):
         for i, (width, height) in enumerate(widths):
             glyph = bytes([ord("A") + frame * 3 + i])
-            body = (glyph * width + b"\n") * height
+            row = glyph * width if frame == 0 else glyph * (width - 2) + b"  "
+            body = (row + b"\n") * height
             index.extend(struct.pack("<IIQII", width, frame, len(payload), len(body), 0))
             payload.extend(body)
     path.write_bytes(struct.pack("<4sIII", b"CSMV", 2, len(meta), 6) + meta + index + payload)
@@ -49,8 +50,13 @@ def expect(fd, status, glyph=None):
             if not data:
                 break
             output.extend(data)
-            if status in output and (glyph is None or glyph in output):
-                return
+            while b"\x1b[?2026l" in output:
+                update, _, output = output.partition(b"\x1b[?2026l")
+                _, begin, paint = update.partition(b"\x1b[?2026h")
+                assert begin, "Frame ended without beginning a synchronized update"
+                assert b"\x1b[2J" not in paint, "Screen erased during playback"
+                if status in paint and (glyph is None or glyph in paint):
+                    return paint
     raise AssertionError(f"Missing {status!r} or {glyph!r}: {output[-300:]!r}")
 
 
@@ -71,7 +77,11 @@ def check(binary, root):
         os.write(fd, b"g")
         expect(fd, b"Go to frame")
         os.write(fd, b"2\r")
-        expect(fd, b"frame 2/2 | 37x39 auto", b"E" * 37)
+        expect(fd, b"frame 2/2 | 37x39 auto", b"E" * 35 + b"  ")
+        os.write(fd, b"[")
+        smaller = expect(fd, b"frame 2/2 | 22x23 manual", b"D" * 20 + b"  ")
+        # The first row used to contain artwork. It is now entirely letterbox.
+        assert b"\x1b[1;1H" + b" " * 80 in smaller
         os.write(fd, b"p")
         expect(fd, b"frame 2/2 | 70x74 map", b"F" * 5)
         os.write(fd, b"q")
