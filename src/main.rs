@@ -5,19 +5,31 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use cascii_core_view::{AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, parse_cframe, parse_cframe_text, parse_packed_cframes};
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use cascii_core_view::{AnimationController, Frame, FrameColors, FrameFile, LoopMode, ProjectDetails, AnimationState};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor};
 use crossterm::terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
-use crossterm::{execute, queue};
+use crossterm::{SynchronizedUpdate, execute, queue};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
+mod audio;
+mod detail;
+mod frames;
+mod input;
+mod tiles;
 mod library;
 mod settings;
 
+use audio::Audio;
+use detail::{Curve, Detail, Direction};
+use frames::Frames;
+use input::Input;
+
 #[derive(Debug, Parser)]
-#[command(author, version, about = "Terminal player for Cascii frame directories and packed binaries")]
+#[command(author, version, about = "Terminal player for fixed and responsive Cascii animations")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -74,25 +86,87 @@ enum ConfigSetting {
     SavePath {
         path: PathBuf,
     },
+
+    /// Enable or disable colored rendering by default
+    Color {
+        value: OnOff,
+    },
+
+    /// Set the default playback speed in frames per second
+    Fps {
+        /// Positive whole-number frame rate
+        #[arg(value_parser = parse_positive_fps)]
+        fps: u32,
+    },
+
+    /// Enable or disable fit-to-terminal rendering by default
+    Fit {
+        value: OnOff,
+    },
+
+    /// Enable or disable looping by default
+    Loop {
+        value: OnOff,
+    },
+
+    /// Hide or show the entire information bar by default
+    HideBar {
+        value: OnOff,
+    },
+
+    /// Show or hide one field in the information bar
+    Bar {
+        field: BarField,
+        value: OnOff,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OnOff {
+    #[value(alias = "true", alias = "yes")]
+    On,
+    #[value(alias = "false", alias = "no")]
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum BarField {
+    Frame,
+    Range,
+    State,
+    Fps,
+    Loop,
+    Fit,
+    Color,
+    Audio,
+    Controls,
 }
 
 #[derive(Debug, ClapArgs)]
 struct PlaybackArgs {
-    /// Frame directory, packed binary path, or saved animation name
+    /// Frame directory, animation file, HTTP(S) asset URL, or saved animation name
     #[arg(default_value = ".")]
     path: PathBuf,
 
-    /// Starting playback FPS (overrides details.toml)
-    #[arg(long)]
+    /// Playback FPS (overrides the manifest, details.toml and settings)
+    #[arg(long, value_parser = parse_positive_fps)]
     fps: Option<u32>,
 
     /// Play once instead of looping
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "looping")]
     once: bool,
 
+    /// Loop this playback
+    #[arg(long = "loop", default_value_t = false, conflicts_with = "once")]
+    looping: bool,
+
     /// Enable colored rendering from .cframe data
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "no_color")]
     color: bool,
+
+    /// Disable colored rendering for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "color")]
+    no_color: bool,
 
     /// Packed multi-frame blob to play (relative paths use PATH)
     #[arg(long, value_name = "FILE")]
@@ -106,28 +180,73 @@ struct PlaybackArgs {
     #[arg(long, value_name = "POSITION")]
     end: Option<f64>,
 
+    /// Fit frames within the terminal for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "no_fit")]
+    fit: bool,
+
     /// Preserve native frame dimensions and crop content that exceeds the terminal
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with = "fit")]
     no_fit: bool,
+
+    /// Select the nearest generated grid width
+    #[arg(long, conflicts_with_all = ["column_map", "transition"], value_parser = clap::value_parser!(u32).range(1..))]
+    columns: Option<u32>,
+
+    /// Follow the authored width for each frame
+    #[arg(long, conflicts_with = "transition")]
+    column_map: bool,
+
+    /// Animate detail across the timeline
+    #[arg(long, value_enum)]
+    transition: Option<Curve>,
+
+    /// Direction of the detail transition (default: down)
+    #[arg(long, value_enum, requires = "transition")]
+    direction: Option<Direction>,
+
+    /// Start paused on the first frame of the active range
+    #[arg(long)]
+    paused: bool,
+
+    /// Play without opening an audio device
+    #[arg(long)]
+    no_audio: bool,
+
+    /// Show the information bar for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "hide_bar")]
+    show_bar: bool,
+
+    /// Hide the information bar for this playback
+    #[arg(long, default_value_t = false, conflicts_with = "show_bar")]
+    hide_bar: bool,
 }
 
 struct TerminalGuard {
     stdout: BufWriter<Stdout>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ColorMode { Full, Project, Mono }
+
 struct DisplayState {
+    mode: ColorMode,
+    grid: Option<(u32, u32, Detail)>,
+    seek_input: Option<String>,
+    audio_status: String,
     colors: FrameColors,
     has_any_color: bool,
-    has_audio: bool,
     fit_to_terminal: bool,
+    hide_bar: bool,
+    bar: settings::BarSettings,
 }
 
 impl TerminalGuard {
     fn enter() -> Result<Self> {
-        let mut stdout = BufWriter::with_capacity(1024 * 1024, io::stdout());
+        let stdout = BufWriter::with_capacity(1024 * 1024, io::stdout());
         terminal::enable_raw_mode().context("enabling raw mode")?;
-        execute!(stdout, EnterAlternateScreen, Hide, Clear(ClearType::All)).context("entering alternate screen")?;
-        Ok(Self {stdout})
+        let mut guard = Self {stdout};
+        execute!(guard.stdout, EnterAlternateScreen, Hide, Clear(ClearType::All)).context("entering alternate screen")?;
+        Ok(guard)
     }
 }
 
@@ -157,47 +276,62 @@ fn main() -> Result<()> {
 }
 
 fn save_animation(source: &Path, requested_name: Option<String>, save_path: &Path) -> Result<(String, PathBuf)> {
-    validate_animation_source(source)?;
+    let input = Input::from_path(source)?;
     let name = match requested_name {
         Some(name) => name,
-        None => infer_save_name(source)?,
+        None if source.is_dir() => source.canonicalize()?.file_name().and_then(|s| s.to_str()).context("Cannot infer animation name")?.to_string(),
+        None => {
+            let file = input.name().context("Provide a name for this animation")?;
+            Path::new(file.strip_suffix(".gz").unwrap_or(file)).file_stem().and_then(|s| s.to_str()).context("Cannot infer animation name")?.to_string()
+        }
     };
-    let destination = library::save(source, &name, save_path)?;
+    if source.is_dir() {
+        validate_animation_source(source)?;
+        return Ok((name.clone(), library::save(source, &name, save_path)?));
+    }
+
+    // Build and validate a self-contained package before making a named entry visible.
+    let stage = tempfile::tempdir()?;
+    let original = input.name().context("Missing input filename")?;
+    let filename = if original.ends_with(".txt") {"frame_0001.txt"} else {original};
+    let file = stage.path().join(filename);
+    input.copy_to(&file)?;
+    let mut frames = Frames::open(&Input::Path(file.clone()))?;
+    if let Frames::Tiles(tiles) = &frames {
+        tiles.copy_sidecars_from(&input, stage.path())?;
+    }
+    if let Input::Path(path) = &input {
+        let details = path.with_file_name("details.toml");
+        if details.is_file() { Input::Path(details).copy_to(&stage.path().join("details.toml"))?; }
+    }
+    if let Some(audio) = audio_input(&input, frames.manifest().is_some_and(|m| m.audio.is_some()))? {
+        audio.copy_to(&stage.path().join("audio.mp3"))?;
+    }
+    frames.validate()?;
+    drop(frames);
+    // A packed file can legally have an arbitrary extension. Give saved copies a
+    // discoverable name so named playback goes through the same format dispatch.
+    if !is_playback_filename(filename) && !filename.ends_with(".txt") && !filename.ends_with(".cframe") {
+        fs::rename(&file, stage.path().join("animation.bin"))?;
+    }
+    let destination = library::save(stage.path(), &name, save_path)?;
     Ok((name, destination))
 }
 
-fn infer_save_name(source: &Path) -> Result<String> {
-    let metadata = fs::metadata(source)
-        .with_context(|| format!("reading source path {}", source.display()))?;
-    let resolved_source = if source.file_name().is_some() {
-        source.to_path_buf()
-    } else {
-        source.canonicalize()
-            .with_context(|| format!("resolving source path {}", source.display()))?
-    };
-    let candidate = if metadata.is_file() {
-        resolved_source.file_stem()
-    } else {
-        resolved_source.file_name()
-    };
-    let name = candidate.and_then(|value| value.to_str()).filter(|value| !value.is_empty()).with_context(|| format!("cannot infer an animation name from {}; provide NAME explicitly", source.display()))?;
-    Ok(name.to_string())
+fn validate_animation_source(source: &Path) -> Result<()> {
+    Frames::open(&Input::from_path(source)?)?.validate()
 }
 
-fn validate_animation_source(source: &Path) -> Result<()> {
-    if source.is_file() {
-        load_packed_frames(source, true)?;
-        return Ok(());
-    }
-    if source.is_dir() {
-        if let Some(binary) = find_standalone_binary(source)? {
-            load_packed_frames(&binary, true)?;
-        } else {
-            load_frames(source, true)?;
-        }
-        return Ok(());
-    }
-    bail!("Animation source must be a readable frame directory or packed binary: {}", source.display())
+fn audio_input(input: &Input, declared: bool) -> Result<Option<Input>> {
+    let audio = match input {
+        Input::Path(path) if path.is_dir() => Input::Path(path.join("audio.mp3")),
+        _ => input.sibling("audio.mp3")?,
+    };
+    Ok(match &audio {
+        Input::Path(path) if path.is_file() => Some(audio),
+        Input::Url(_, _) if declared => Some(audio),
+        _ => None,
+    })
 }
 
 fn run_config(args: ConfigArgs, app_paths: &settings::AppPaths, app_settings: &mut settings::Settings) -> Result<()> {
@@ -211,52 +345,176 @@ fn run_config(args: ConfigArgs, app_paths: &settings::AppPaths, app_settings: &m
         ConfigCommand::Path => {
             println!("{}", app_paths.settings_file.display());
         }
-        ConfigCommand::Set {setting: ConfigSetting::SavePath {path}} => {
-            settings::set_save_path(app_paths, app_settings, &path)?;
-            println!("Save path set to {}", app_settings.save_path.display());
+        ConfigCommand::Set {setting} => match setting {
+            ConfigSetting::SavePath {path} => {
+                settings::set_save_path(app_paths, app_settings, &path)?;
+                println!("Save path set to {}", app_settings.save_path.display());
+            }
+            ConfigSetting::Color {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_color(app_paths, app_settings, enabled)?;
+                println!("Default color rendering set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::Fps {fps} => {
+                settings::set_fps(app_paths, app_settings, fps)?;
+                println!("Default playback speed set to {fps} FPS");
+            }
+            ConfigSetting::Fit {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_fit(app_paths, app_settings, enabled)?;
+                println!("Default fit-to-terminal rendering set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::Loop {value} => {
+                let enabled = matches!(value, OnOff::On);
+                settings::set_loop(app_paths, app_settings, enabled)?;
+                println!("Default looping set to {}", if enabled {"on"} else {"off"});
+            }
+            ConfigSetting::HideBar {value} => {
+                let hidden = matches!(value, OnOff::On);
+                settings::set_hide_bar(app_paths, app_settings, hidden)?;
+                println!("Default information bar hiding set to {}", if hidden {"on"} else {"off"});
+            }
+            ConfigSetting::Bar {field, value} => {
+                let visible = matches!(value, OnOff::On);
+                set_bar_field(&mut app_settings.bar, field, visible);
+                settings::write(app_paths, app_settings)?;
+                println!("Information bar field {} set to {}", field_name(field), if visible {"visible"} else {"hidden"});
+            }
         }
     }
     Ok(())
 }
 
 fn play(mut args: PlaybackArgs, app_settings: &settings::Settings) -> Result<()> {
+    let use_color = playback_uses_color(&args, app_settings);
+    let fit_to_terminal = playback_fits_terminal(&args, app_settings);
+    let loop_playback = playback_loops(&args, app_settings);
+    let hide_bar = playback_hides_bar(&args, app_settings);
     args.path = library::resolve(&args.path, &app_settings.save_path);
-    let direct_binary = args.path.is_file().then(|| args.path.clone());
-    let discovered_binary = if direct_binary.is_none() && args.packed.is_none() && args.path.is_dir() {
-        find_standalone_binary(&args.path)?
+    let input = if let Some(packed) = &args.packed {
+        if !args.path.is_dir() { bail!("The playback path must be a directory when --packed is used"); }
+        Input::from_path(&resolve_packed_path(&args.path, packed))?
     } else {
-        None
+        Input::from_path(&args.path)?
     };
-    let binary_path = direct_binary.or(discovered_binary);
-    let details_directory = binary_path.as_ref().and_then(|path| path.parent()).unwrap_or(&args.path);
-    let details = load_project_details(details_directory);
-    let colors = details.frame_colors();
-    let has_audio = details.audio.unwrap_or(false);
-    let fps = args.fps.unwrap_or_else(|| details.fps.unwrap_or(24));
-
-    let frames = if let Some(packed_path) = args.packed.as_ref() {
-        if !args.path.is_dir() {
-            bail!("The playback path must be a directory when --packed is used");
-        }
-        load_packed_frames(&resolve_packed_path(&args.path, packed_path), args.color)?
-    } else if let Some(binary_path) = binary_path {
-        load_packed_frames(&binary_path, args.color)?
-    } else {
-        load_frames(&args.path, args.color)?
+    let frames = Frames::open(&input)?;
+    let manifest = frames.manifest();
+    let project = if args.packed.is_some() { Input::Path(args.path.clone()) } else { input.clone() };
+    let details = match &project {
+        Input::Path(path) => load_project_details(if path.is_dir() {path} else {path.parent().unwrap_or(Path::new("."))}),
+        Input::Url(_, _) => ProjectDetails::default(),
     };
-    let has_any_color = frames.iter().any(Frame::has_color);
-
+    let project_fps = manifest.map(|m| m.fps).or(details.fps).filter(|fps| *fps > 0);
+    let fps = playback_fps(args.fps, project_fps, app_settings);
+    let explicit_detail = args.columns.is_some() || args.column_map || args.transition.is_some();
+    if explicit_detail && manifest.is_none() { bail!("Detail selection requires a multi-size animation"); }
+    let detail = match (args.columns, args.transition) {
+        (Some(columns), _) => Detail::Width(columns),
+        (_, Some(curve)) => Detail::Transition(curve, args.direction.unwrap_or(Direction::Down)),
+        _ if args.column_map || !fit_to_terminal => Detail::Authored,
+        _ => Detail::Auto,
+    };
     let mut controller = AnimationController::new(fps);
-    controller.set_frame_count(frames.len());
-    if args.once {
-        controller.set_loop_mode(LoopMode::Once);
-    }
+    controller.set_frame_count(frames.count());
+    if !loop_playback { controller.set_loop_mode(LoopMode::Once); }
     configure_range(&mut controller, args.start, args.end)?;
-    controller.play();
+    if !args.paused { controller.play(); }
 
-    let display = DisplayState {colors, has_any_color, has_audio, fit_to_terminal: !args.no_fit};
+    let track = audio_input(&project, manifest.is_some_and(|m| m.audio.is_some()) || details.audio == Some(true))?;
+    let mut audio_status = if track.is_some() {"disabled"} else {"no"}.to_string();
+    let audio = if let Some(track) = track.filter(|_| !args.no_audio) {
+        match Audio::open(track, project_fps.unwrap_or(app_settings.fps)) {
+            Ok(audio) => { audio_status = audio.level(); Some(audio) }
+            Err(e) => { eprintln!("Audio unavailable: {e:#}"); audio_status = "unavailable".into(); None }
+        }
+    } else { None };
+    let has_any_color = frames.has_color();
+    let display = DisplayState {
+        mode: if use_color && has_any_color {ColorMode::Full} else {ColorMode::Project},
+        colors: details.frame_colors(), has_any_color, audio_status, grid: None, seek_input: None,
+        fit_to_terminal, hide_bar, bar: app_settings.bar.clone(),
+    };
+    run_player(frames, controller, display, detail, audio)
+}
 
-    run_player(frames, controller, display)
+fn playback_uses_color(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.color {
+        true
+    } else if args.no_color {
+        false
+    } else {
+        settings.color
+    }
+}
+
+fn playback_fps(requested_fps: Option<u32>, project_fps: Option<u32>, settings: &settings::Settings) -> u32 {
+    requested_fps.or(project_fps).unwrap_or(settings.fps)
+}
+
+fn playback_fits_terminal(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.fit {
+        true
+    } else if args.no_fit {
+        false
+    } else {
+        settings.fit
+    }
+}
+
+fn playback_loops(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.looping {
+        true
+    } else if args.once {
+        false
+    } else {
+        settings.loop_playback
+    }
+}
+
+fn playback_hides_bar(args: &PlaybackArgs, settings: &settings::Settings) -> bool {
+    if args.hide_bar {
+        true
+    } else if args.show_bar {
+        false
+    } else {
+        settings.hide_bar
+    }
+}
+
+fn set_bar_field(bar: &mut settings::BarSettings, field: BarField, visible: bool) {
+    match field {
+        BarField::Frame => bar.frame = visible,
+        BarField::Range => bar.range = visible,
+        BarField::State => bar.state = visible,
+        BarField::Fps => bar.fps = visible,
+        BarField::Loop => bar.loop_mode = visible,
+        BarField::Fit => bar.fit = visible,
+        BarField::Color => bar.color = visible,
+        BarField::Audio => bar.audio = visible,
+        BarField::Controls => bar.controls = visible,
+    }
+}
+
+fn field_name(field: BarField) -> &'static str {
+    match field {
+        BarField::Frame => "frame",
+        BarField::Range => "range",
+        BarField::State => "state",
+        BarField::Fps => "fps",
+        BarField::Loop => "loop",
+        BarField::Fit => "fit",
+        BarField::Color => "color",
+        BarField::Audio => "audio",
+        BarField::Controls => "controls",
+    }
+}
+
+fn parse_positive_fps(value: &str) -> std::result::Result<u32, String> {
+    let fps = value.parse::<u32>().map_err(|_| "FPS must be a positive whole number".to_string())?;
+    if fps == 0 {
+        return Err("FPS must be at least 1".to_string());
+    }
+    Ok(fps)
 }
 
 fn resolve_packed_path(directory: &Path, packed_path: &Path) -> PathBuf {
@@ -278,104 +536,149 @@ fn configure_range(controller: &mut AnimationController, start: Option<f64>, end
     Ok(())
 }
 
-fn run_player(frames: Vec<Frame>, mut controller: AnimationController, mut display: DisplayState) -> Result<()> {
-    if frames.is_empty() {
-        bail!("No frames to display");
-    }
-
+fn run_player(mut frames: Frames, mut controller: AnimationController, mut display: DisplayState, mut detail: Detail, mut audio: Option<Audio>) -> Result<()> {
     let mut terminal = TerminalGuard::enter()?;
+    // Register resize notifications before drawing the first (possibly paused) frame.
+    event::poll(Duration::ZERO)?;
     let mut needs_redraw = true;
+    let mut sync_audio = true;
     let mut next_tick = Instant::now() + frame_duration(&controller);
+    let mut clock_before_seek = None;
+    let mut reset_clock = true;
+    let project_colors = display.colors.clone();
+    let mut cached = None;
+    let mut previous_layout = None;
 
     loop {
         if needs_redraw {
-            let current_idx = controller.current_frame();
-            let frame = frames.get(current_idx).context("current frame index out of bounds")?;
-            render_frame(&mut terminal.stdout, frame, &controller, current_idx, frames.len(), &display)?;
-            terminal.stdout.flush().context("flushing terminal output")?;
+            let size = terminal::size().context("reading terminal size")?;
+            let rows = size.1.saturating_sub(u16::from(!display.hide_bar || display.seek_input.is_some()));
+            let index = controller.current_frame();
+            let columns = frames.manifest().map_or(0, |m| detail.columns(m, index, size.0, rows));
+            let key = (index, columns, display.mode == ColorMode::Full);
+            if cached.as_ref().is_none_or(|(last, _)| *last != key) {
+                let frame = frames.frame(index, columns, key.2).with_context(|| format!("loading frame {}", index + 1))?;
+                cached = Some((key, frame));
+            }
+            let frame = &cached.as_ref().unwrap().1;
+            display.grid = (columns > 0).then(|| (columns, frame.dimensions().1 as u32, detail));
+            let layout = terminal.stdout.sync_update(|out| {
+                render_frame(out, frame, &controller, &display, size, previous_layout)
+            }).context("presenting terminal frame")??;
+            previous_layout = Some(layout);
             needs_redraw = false;
         }
+        if sync_audio {
+            if let Some(track) = &mut audio && let Err(e) = track.sync(&controller) {
+                display.audio_status = format!("unavailable ({e})");
+                audio = None;
+                needs_redraw = true;
+            }
+            sync_audio = false;
+        }
+        if reset_clock {
+            // A network fetch or decoder seek can delay the first visible frame.
+            next_tick = Instant::now() + frame_duration(&controller);
+            reset_clock = false;
+        }
 
-        let wait_timeout = if controller.is_playing() {
-            next_tick.saturating_duration_since(Instant::now())
-        } else {
-            Duration::from_millis(250)
-        };
-
-        if event::poll(wait_timeout).context("polling terminal events")? {
-            match event::read().context("reading terminal event")? {
+        let wait = if controller.is_playing() { next_tick.saturating_duration_since(Instant::now()) } else { Duration::from_millis(250) };
+        if event::poll(wait)? {
+            match event::read()? {
                 Event::Resize(_, _) => {
+                    previous_layout = None;
                     needs_redraw = true;
                 }
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    needs_redraw = true;
+                    if let Some(entry) = &mut display.seek_input {
+                        match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() && entry.len() < 12 => entry.push(c),
+                            KeyCode::Backspace => { entry.pop(); }
+                            KeyCode::Esc | KeyCode::Enter => {
+                                controller = clock_before_seek.take().expect("seek prompt saves the controller");
+                                if key.code == KeyCode::Enter && let Ok(target) = entry.parse::<usize>() {
+                                    if controller.state() == AnimationState::Finished { controller.stop(); }
+                                    controller.set_current_frame(target.saturating_sub(1));
+                                }
+                                display.seek_input = None;
+                                sync_audio = true;
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char(' ') => { controller.toggle(); sync_audio = true; }
+                            KeyCode::Right => { controller.step_forward(); sync_audio = true; }
+                            KeyCode::Left => { controller.step_backward(); sync_audio = true; }
+                            KeyCode::Home | KeyCode::End => {
+                                let (first, last) = controller.range_frames();
+                                controller.set_current_frame(if key.code == KeyCode::Home {first} else {last});
+                                sync_audio = true;
+                            }
+                            KeyCode::Char('g') => {
+                                clock_before_seek = Some(controller.clone());
+                                controller.pause();
+                                display.seek_input = Some(String::new());
+                                sync_audio = true;
+                            }
+                            KeyCode::Char('+' | '=') => { controller.set_fps(controller.fps().saturating_add(1)); sync_audio = true; }
+                            KeyCode::Char('-' | '_') => { controller.set_fps(controller.fps().saturating_sub(1)); sync_audio = true; }
+                            KeyCode::Char('l') => {
+                                controller.set_loop_mode(match controller.loop_mode() {LoopMode::Loop => LoopMode::Once, LoopMode::Once => LoopMode::Loop});
+                            }
+                            KeyCode::Char('f') => {
+                                display.fit_to_terminal = !display.fit_to_terminal;
+                                detail = if display.fit_to_terminal {Detail::Auto} else {Detail::Authored};
+                            }
+                            KeyCode::Char('a') => { detail = Detail::Auto; display.fit_to_terminal = true; }
+                            KeyCode::Char('p') => detail = Detail::Authored,
+                            KeyCode::Char('t') if frames.manifest().is_some() => detail = detail.next_curve(),
+                            KeyCode::Char('r') => detail = detail.reverse(),
+                            KeyCode::Char('[' | ']') => {
+                                if let (Some(manifest), Some((columns, _, _))) = (frames.manifest(), display.grid) {
+                                    detail.step(manifest, columns, key.code == KeyCode::Char(']'));
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                display.mode = match display.mode {
+                                    ColorMode::Full => ColorMode::Mono,
+                                    ColorMode::Mono if project_colors != ProjectDetails::default().frame_colors() || !display.has_any_color => ColorMode::Project,
+                                    ColorMode::Mono | ColorMode::Project if display.has_any_color => ColorMode::Full,
+                                    _ => ColorMode::Mono,
+                                };
+                                display.colors = if display.mode == ColorMode::Mono {ProjectDetails::default().frame_colors()} else {project_colors.clone()};
+                            }
+                            KeyCode::Char('m' | ',' | '.') => {
+                                if let Some(track) = &mut audio {
+                                    match key.code {
+                                        KeyCode::Char('m') => track.toggle_mute(),
+                                        KeyCode::Char(',') => track.adjust_volume(-0.1),
+                                        _ => track.adjust_volume(0.1),
+                                    }
+                                    display.audio_status = track.level();
+                                }
+                            }
+                            _ => {}
+                        }
                     }
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => break,
-                        KeyCode::Char(' ') => {
-                            controller.toggle();
-                            next_tick = Instant::now() + frame_duration(&controller);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Right => {
-                            controller.step_forward();
-                            needs_redraw = true;
-                        }
-                        KeyCode::Left => {
-                            controller.step_backward();
-                            needs_redraw = true;
-                        }
-                        KeyCode::Home => {
-                            let (range_start, _) = controller.range_frames();
-                            controller.set_current_frame(range_start);
-                            needs_redraw = true;
-                        }
-                        KeyCode::End => {
-                            let (_, range_end) = controller.range_frames();
-                            controller.set_current_frame(range_end);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char('+') | KeyCode::Char('=') => {
-                            controller.set_fps(controller.fps().saturating_add(1));
-                            next_tick = Instant::now() + frame_duration(&controller);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char('-') | KeyCode::Char('_') => {
-                            controller.set_fps(controller.fps().saturating_sub(1));
-                            next_tick = Instant::now() + frame_duration(&controller);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char('l') => {
-                            let next_mode = match controller.loop_mode() {
-                                LoopMode::Loop => LoopMode::Once,
-                                LoopMode::Once => LoopMode::Loop,
-                            };
-                            controller.set_loop_mode(next_mode);
-                            needs_redraw = true;
-                        }
-                        KeyCode::Char('f') => {
-                            display.fit_to_terminal = !display.fit_to_terminal;
-                            needs_redraw = true;
-                        }
-                        _ => {}
-                    }
+                    if sync_audio { reset_clock = true; }
                 }
                 _ => {}
             }
         }
 
-        if controller.is_playing() && Instant::now() >= next_tick {
-            let now = Instant::now();
+        if !reset_clock && controller.is_playing() && Instant::now() >= next_tick {
             let duration = frame_duration(&controller);
-            let overdue_intervals = now.duration_since(next_tick).as_nanos() / duration.as_nanos();
-            let ticks_due = (overdue_intervals + 1).min(u32::MAX as u128) as u32;
+            let ticks_due = (1 + Instant::now().duration_since(next_tick).as_nanos() / duration.as_nanos()).min(u32::MAX as u128) as u32;
+            let crossed_end = u64::from(ticks_due) > (controller.range_frames().1 - controller.current_frame()) as u64;
             advance_controller(&mut controller, ticks_due);
+            sync_audio |= crossed_end;
             next_tick += duration * ticks_due;
             needs_redraw = true;
         }
     }
-
     Ok(())
 }
 
@@ -411,33 +714,74 @@ fn advance_controller(controller: &mut AnimationController, ticks: u32) {
     }
 }
 
-fn render_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, controller: &AnimationController, frame_index: usize, total_frames: usize, display: &DisplayState) -> Result<()> {
-    let terminal_size = terminal::size().context("reading terminal size")?;
-    let (term_width, term_height) = terminal_size;
-    let drawable_height = term_height.saturating_sub(1) as usize;
-    let term_width_usize = term_width as usize;
-
-    let (bg_r, bg_g, bg_b) = display.colors.background;
-    queue!(stdout, MoveTo(0, 0), SetBackgroundColor(Color::Rgb {r: bg_r, g: bg_g, b: bg_b}), Clear(ClearType::All)).context("clearing frame")?;
-
-    if let Some(cframe) = frame.cframe.as_ref() {
-        let frame_width = cframe.width as usize;
-        let frame_height = cframe.height as usize;
-        let (draw_width, draw_height) = drawable_dimensions(frame_width, frame_height, term_width_usize, drawable_height, display.fit_to_terminal);
-
-        let x_offset = term_width_usize.saturating_sub(draw_width) / 2;
-        let y_offset = drawable_height.saturating_sub(draw_height) / 2;
-
-        draw_cframe(stdout, cframe, draw_width, draw_height, x_offset, y_offset, display)?;
-    } else {
-        draw_text_frame(stdout, frame, term_width_usize, drawable_height, display)?;
-    }
-
-    draw_status_line(stdout, controller, frame_index, total_frames, terminal_size, display)?;
-    Ok(())
+#[derive(Clone, Copy, PartialEq)]
+struct FrameLayout {
+    terminal_width: usize,
+    drawable_rows: usize,
+    width: usize,
+    height: usize,
+    background: Color,
 }
 
-fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrameData, draw_width: usize, draw_height: usize, x_offset: usize, y_offset: usize, display: &DisplayState) -> Result<()> {
+impl FrameLayout {
+    fn left(self) -> usize { (self.terminal_width - self.width) / 2 }
+    fn top(self) -> usize { (self.drawable_rows - self.height) / 2 }
+
+    // Repaint only the letterbox area, including cells exposed by a smaller frame.
+    // The new picture will overwrite the old one directly, even without DEC 2026.
+    fn paint_margins(self, out: &mut impl Write) -> io::Result<()> {
+        let left = self.left();
+        let right = left + self.width;
+        let top = self.top();
+        let spaces = " ".repeat(self.terminal_width);
+        for row in 0..self.drawable_rows {
+            if row < top || row >= top + self.height {
+                queue!(out, MoveTo(0, row as u16), Print(&spaces))?;
+            } else {
+                if left > 0 {
+                    queue!(out, MoveTo(0, row as u16), Print(&spaces[..left]))?;
+                }
+                if right < self.terminal_width {
+                    queue!(out, MoveTo(right as u16, row as u16), Print(&spaces[right..]))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn render_frame(stdout: &mut impl Write, frame: &Frame, controller: &AnimationController, display: &DisplayState, terminal_size: (u16, u16), previous: Option<FrameLayout>) -> Result<FrameLayout> {
+    let show_bar = !display.hide_bar || display.seek_input.is_some();
+    let drawable_rows = usize::from(terminal_size.1.saturating_sub(u16::from(show_bar)));
+    let terminal_width = usize::from(terminal_size.0);
+    let (source_width, source_height) = match &frame.cframe {
+        Some(cframe) => (cframe.width as usize, cframe.height as usize),
+        None => (frame.content.lines().map(UnicodeWidthStr::width).max().unwrap_or(0), frame.content.lines().count()),
+    };
+    let (width, height) = drawable_dimensions(source_width, source_height, terminal_width, drawable_rows, display.fit_to_terminal);
+    let (r, g, b) = display.colors.background;
+    let layout = FrameLayout {terminal_width, drawable_rows, width, height, background: Color::Rgb {r, g, b}};
+
+    queue!(stdout, SetBackgroundColor(layout.background))?;
+    if previous != Some(layout) {
+        layout.paint_margins(stdout)?;
+    }
+    if let Some(cframe) = frame.cframe.as_ref() {
+        draw_cframe(stdout, cframe, layout, display)?;
+    } else {
+        draw_text_frame(stdout, frame, source_width, layout, display)?;
+    }
+    if show_bar && terminal_size.1 > 0 && terminal_width > 0 {
+        draw_status_line(stdout, controller, controller.current_frame(), controller.frame_count(), terminal_size, display)?;
+    }
+    Ok(layout)
+}
+
+fn draw_cframe(stdout: &mut impl Write, cframe: &cascii_core_view::CFrameData, layout: FrameLayout, display: &DisplayState) -> Result<()> {
+    let (draw_width, draw_height) = (layout.width, layout.height);
+    let (x_offset, y_offset) = (layout.left(), layout.top());
+    let mut active_background = display.colors.background;
+    let mut active_foreground = None;
     for row in 0..draw_height {
         let source_row = source_index(row, draw_height, cframe.height as usize, display.fit_to_terminal);
         queue!(stdout, MoveTo(x_offset as u16, (y_offset + row) as u16)).context("moving to colored row")?;
@@ -448,7 +792,7 @@ fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrame
             let background = cframe.bg_rgb_at(source_row, source_col).unwrap_or(display.colors.background);
             let foreground = cframe.has_visible_foreground(source_row, source_col).then(|| cframe.rgb_at(source_row, source_col).unwrap_or((255, 255, 255)));
             let mut run = String::new();
-            run.push(if foreground.is_some() {cframe.char_at(source_row, source_col).unwrap_or(b' ') as char} else {' '});
+            run.push(if foreground.is_some() {printable(cframe.char_at(source_row, source_col).unwrap_or(b' ') as char)} else {' '});
             col += 1;
 
             while col < draw_width {
@@ -458,14 +802,18 @@ fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrame
                 if next_background != background || next_foreground != foreground {
                     break;
                 }
-                run.push(if next_foreground.is_some() {cframe.char_at(source_row, next_source_col).unwrap_or(b' ') as char} else {' '});
+                run.push(if next_foreground.is_some() {printable(cframe.char_at(source_row, next_source_col).unwrap_or(b' ') as char)} else {' '});
                 col += 1;
             }
 
-            let (bg_r, bg_g, bg_b) = background;
-            queue!(stdout, SetBackgroundColor(Color::Rgb {r: bg_r, g: bg_g, b: bg_b})).context("setting colored run background")?;
-            if let Some((fg_r, fg_g, fg_b)) = foreground {
-                queue!(stdout, SetForegroundColor(Color::Rgb {r: fg_r, g: fg_g, b: fg_b})).context("setting colored run foreground")?;
+            if background != active_background {
+                let (r, g, b) = background;
+                queue!(stdout, SetBackgroundColor(Color::Rgb {r, g, b}))?;
+                active_background = background;
+            }
+            if foreground != active_foreground && let Some((r, g, b)) = foreground {
+                queue!(stdout, SetForegroundColor(Color::Rgb {r, g, b}))?;
+                active_foreground = foreground;
             }
             queue!(stdout, Print(run)).context("drawing colored run")?;
         }
@@ -473,53 +821,57 @@ fn draw_cframe(stdout: &mut BufWriter<Stdout>, cframe: &cascii_core_view::CFrame
     Ok(())
 }
 
-fn draw_text_frame(stdout: &mut BufWriter<Stdout>, frame: &Frame, term_width: usize, drawable_height: usize, display: &DisplayState) -> Result<()> {
+fn draw_text_frame(stdout: &mut impl Write, frame: &Frame, source_width: usize, layout: FrameLayout, display: &DisplayState) -> Result<()> {
     let lines: Vec<&str> = frame.content.lines().collect();
-    let frame_height = lines.len();
-    let frame_width = lines.iter().map(|line| line.chars().count()).max().unwrap_or(0);
-    let (draw_width, draw_height) = drawable_dimensions(frame_width, frame_height, term_width, drawable_height, display.fit_to_terminal);
-
-    let x_offset = term_width.saturating_sub(draw_width) / 2;
-    let y_offset = drawable_height.saturating_sub(draw_height) / 2;
-
-    for row in 0..draw_height {
-        let source_row = source_index(row, draw_height, frame_height, display.fit_to_terminal);
-        let line = lines.get(source_row).copied().unwrap_or("");
-        let sampled_line = sample_text_line(line, frame_width, draw_width, display.fit_to_terminal);
-        let mut col = 0usize;
-
-        while col < draw_width {
-            if sampled_line[col] == ' ' {
-                col += 1;
-                continue;
-            }
-
-            let start_col = col;
-            let mut text = String::new();
-            while col < draw_width {
-                let sampled = sampled_line[col];
-                if sampled == ' ' {
-                    break;
-                }
-                text.push(sampled);
-                col += 1;
-            }
-
-            let (fg_r, fg_g, fg_b) = display.colors.foreground;
-            queue!(stdout, MoveTo((x_offset + start_col) as u16, (y_offset + row) as u16), SetForegroundColor(Color::Rgb {r: fg_r, g: fg_g, b: fg_b}), Print(text))
-            .context("drawing text run")?;
-        }
+    let (r, g, b) = display.colors.foreground;
+    queue!(stdout, SetForegroundColor(Color::Rgb {r, g, b}))?;
+    for row in 0..layout.height {
+        let source_row = source_index(row, layout.height, lines.len(), display.fit_to_terminal);
+        let line = sample_text_line(lines[source_row], source_width, layout.width, display.fit_to_terminal);
+        queue!(stdout, MoveTo(layout.left() as u16, (layout.top() + row) as u16), Print(line)).context("drawing text row")?;
     }
-
     Ok(())
 }
 
-fn sample_text_line(line: &str, source_width: usize, draw_width: usize, fit_to_terminal: bool) -> Vec<char> {
-    let characters: Vec<char> = line.chars().collect();
-    (0..draw_width).map(|col| {
-            let source_col = source_index(col, draw_width, source_width, fit_to_terminal);
-            characters.get(source_col).copied().unwrap_or(' ')
-        }).collect()
+fn printable(character: char) -> char {
+    if character.is_control() { ' ' } else { character }
+}
+
+fn sample_text_line(line: &str, source_width: usize, draw_width: usize, fit: bool) -> String {
+    if line.is_ascii() {
+        return (0..draw_width).map(|col| {
+            let source = source_index(col, draw_width, source_width, fit);
+            printable(char::from(line.as_bytes().get(source).copied().unwrap_or(b' ')))
+        }).collect();
+    }
+
+    // A text row must replace exactly its share of the screen, including any
+    // cells previously occupied by a wide glyph or now occupied by spaces.
+    let mut glyphs = line.graphemes(true);
+    let mut output = String::new();
+    let mut glyph = "";
+    let mut glyph_width = 0;
+    let mut source_end = 0;
+    let mut col = 0;
+    while col < draw_width {
+        let source = source_index(col, draw_width, source_width, fit);
+        while source >= source_end {
+            let Some(next) = glyphs.next() else {
+                output.push_str(&" ".repeat(draw_width - col));
+                return output;
+            };
+            glyph = if next.chars().any(char::is_control) { " " } else { next };
+            glyph_width = glyph.width();
+            source_end += glyph_width;
+        }
+        if glyph_width > draw_width - col {
+            output.push_str(&" ".repeat(draw_width - col));
+            break;
+        }
+        output.push_str(glyph);
+        col += glyph_width;
+    }
+    output
 }
 
 fn drawable_dimensions(frame_width: usize, frame_height: usize, max_width: usize, max_height: usize, fit_to_terminal: bool) -> (usize, usize) {
@@ -549,20 +901,58 @@ fn source_index(target_index: usize, target_len: usize, source_len: usize, fit_t
     (numerator / denominator) as usize
 }
 
-fn draw_status_line(stdout: &mut BufWriter<Stdout>, controller: &AnimationController, frame_index: usize, total_frames: usize, terminal_size: (u16, u16), display: &DisplayState) -> Result<()> {
+fn draw_status_line(stdout: &mut impl Write, controller: &AnimationController, frame_index: usize, total_frames: usize, terminal_size: (u16, u16), display: &DisplayState) -> Result<()> {
     let (term_width, term_height) = terminal_size;
+    let status = status_text(controller, frame_index, total_frames, display);
+    let status_line = truncate_to_width(&status, term_width as usize);
+    let y = term_height.saturating_sub(1);
+    let padded = format!("{status_line:<width$}", width = usize::from(term_width));
+    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(padded), ResetColor).context("drawing status line")?;
+    Ok(())
+}
+
+fn status_text(controller: &AnimationController, frame_index: usize, total_frames: usize, display: &DisplayState) -> String {
+    if let Some(value) = &display.seek_input {
+        return format!("Go to frame (1-{total_frames}): {value}_  Enter / Esc");
+    }
     let playback_state = format!("{:?}", controller.state()).to_lowercase();
     let loop_mode = match controller.loop_mode() {
         LoopMode::Loop => "loop",
         LoopMode::Once => "once",
     };
     let (range_start, range_end) = controller.range_frames();
-    let status = format!("frame {}/{} | range {}-{} | {} | {} fps | {} | fit:{} | color:{} | audio:{} | [space] play/pause [←/→] step [home/end] range [+/-] fps [f] fit [l] loop [q] quit", frame_index + 1, total_frames, range_start + 1, range_end + 1, playback_state, controller.fps(), loop_mode, if display.fit_to_terminal {"on"} else {"off"}, if display.has_any_color {"on"} else {"off"}, if display.has_audio {"yes"} else {"no"});
-    let status_line = truncate_to_width(&status, term_width as usize);
-    let y = term_height.saturating_sub(1);
-    let clear_line = " ".repeat(term_width as usize);
-    queue!(stdout, MoveTo(0, y), SetForegroundColor(Color::DarkGrey), SetBackgroundColor(Color::Reset), Print(clear_line), MoveTo(0, y), Print(status_line), ResetColor).context("drawing status line")?;
-    Ok(())
+    let mut fields = Vec::new();
+    if display.bar.frame {
+        fields.push(format!("frame {}/{}", frame_index + 1, total_frames));
+    }
+    if let Some((columns, rows, mode)) = display.grid.filter(|_| display.bar.fit) {
+        fields.push(format!("{columns}x{rows} {}", mode.label()));
+    }
+    if display.bar.range {
+        fields.push(format!("range {}-{}", range_start + 1, range_end + 1));
+    }
+    if display.bar.state {
+        fields.push(playback_state);
+    }
+    if display.bar.fps {
+        fields.push(format!("{} fps", controller.fps()));
+    }
+    if display.bar.loop_mode {
+        fields.push(loop_mode.to_string());
+    }
+    if display.bar.fit {
+        fields.push(format!("fit:{}", if display.fit_to_terminal {"on"} else {"off"}));
+    }
+    if display.bar.color {
+        fields.push(format!("color:{}", match display.mode { ColorMode::Full => "on", ColorMode::Project => "project", ColorMode::Mono => "mono" }));
+    }
+    if display.bar.audio {
+        fields.push(format!("audio:{}", display.audio_status));
+    }
+    if display.bar.controls {
+        fields.push("[space] play/pause [←/→] step [home/end] range [+/-] fps [f] fit [a/p] auto/map [ / ] width [g] go [c] color [m] mute [l] loop [q] quit".to_string());
+    }
+    fields.join(" | ")
 }
 
 fn truncate_to_width(input: &str, width: usize) -> String {
@@ -578,127 +968,9 @@ fn load_project_details(directory: &Path) -> ProjectDetails {
     }
 }
 
-fn load_frames(directory: &Path, use_color: bool) -> Result<Vec<Frame>> {
-    // Prefer .txt files when available (monochrome by default).
-    let txt_paths = collect_frame_paths(directory, "txt", true)?;
-    if !txt_paths.is_empty() {
-        let mut frames = Vec::with_capacity(txt_paths.len());
-        for txt_path in &txt_paths {
-            let content = fs::read_to_string(txt_path).with_context(|| format!("reading {}", txt_path.display()))?;
-            let content = normalize_frame_text(content);
-            let cframe_path = txt_path.with_extension("cframe");
-
-            if use_color && cframe_path.exists() {
-                let data = fs::read(&cframe_path).with_context(|| format!("reading {}", cframe_path.display()))?;
-                let cframe = parse_cframe(&data).with_context(|| format!("parsing .cframe file {}", cframe_path.display()))?;
-                frames.push(Frame::with_color(content, cframe));
-            } else {
-                frames.push(Frame::text_only(content));
-            }
-        }
-        return Ok(frames);
-    }
-
-    // Fallback: load .cframe files directly when no .txt files exist.
-    let cframe_paths = collect_frame_paths(directory, "cframe", false)?;
-    if cframe_paths.is_empty() {
-        bail!("No frame files found in {} (expected .cframe or frame_*.txt)", directory.display());
-    }
-
-    let mut frames = Vec::with_capacity(cframe_paths.len());
-    for path in cframe_paths {
-        let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let cframe = parse_cframe(&data)
-            .with_context(|| format!("parsing .cframe file {}", path.display()))?;
-        let text = parse_cframe_text(&data)
-            .with_context(|| format!("extracting text from {}", path.display()))?;
-        if use_color {
-            frames.push(Frame::with_color(text, cframe));
-        } else {
-            frames.push(Frame::text_only(text));
-        }
-    }
-
-    Ok(frames)
-}
-
-fn load_packed_frames(path: &Path, use_color: bool) -> Result<Vec<Frame>> {
-    let data = fs::read(path).with_context(|| format!("reading packed animation {}", path.display()))?;
-    frames_from_binary_data(&data, use_color).with_context(|| format!("parsing packed animation {}", path.display()))
-}
-
-fn frames_from_binary_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
-    if data.starts_with(b"CFPK") {
-        frames_from_full_cframe_pack(data, use_color)
-    } else {
-        frames_from_packed_data(data, use_color)
-    }
-}
-
-fn frames_from_full_cframe_pack(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
-    const HEADER_SIZE: usize = 12;
-    const SUPPORTED_VERSION: u32 = 1;
-
-    if data.len() < HEADER_SIZE {
-        bail!("full cframe pack is too small");
-    }
-    if &data[0..4] != b"CFPK" {
-        bail!("full cframe pack has invalid magic");
-    }
-    let version = u32::from_le_bytes(data[4..8].try_into().expect("validated CFPK version bytes"));
-    if version != SUPPORTED_VERSION {
-        bail!("unsupported full cframe pack version: {version}");
-    }
-    let frame_count = u32::from_le_bytes(data[8..12].try_into().expect("validated CFPK frame count bytes")) as usize;
-    if frame_count == 0 {
-        bail!("full cframe pack contains no frames");
-    }
-
-    let mut frames = Vec::with_capacity(frame_count);
-    let mut offset = HEADER_SIZE;
-    for frame_index in 0..frame_count {
-        let length_end = offset.checked_add(4).context("full cframe pack offset overflow")?;
-        if length_end > data.len() {
-            bail!("full cframe pack is truncated before frame {frame_index} length");
-        }
-        let frame_len = u32::from_le_bytes(data[offset..length_end].try_into().expect("validated CFPK frame length bytes")) as usize;
-        offset = length_end;
-        let frame_end = offset.checked_add(frame_len).context("full cframe pack frame length overflow")?;
-        if frame_end > data.len() {
-            bail!("full cframe pack is truncated inside frame {frame_index}");
-        }
-
-        let frame_data = &data[offset..frame_end];
-        let cframe = parse_cframe(frame_data)
-            .with_context(|| format!("parsing full cframe pack frame {frame_index}"))?;
-        let text = cframe.to_text();
-        if use_color {
-            frames.push(Frame::with_color(text, cframe));
-        } else {
-            frames.push(Frame::text_only(text));
-        }
-        offset = frame_end;
-    }
-
-    if offset != data.len() {
-        bail!("full cframe pack has {} trailing bytes", data.len() - offset);
-    }
-    Ok(frames)
-}
-
-fn frames_from_packed_data(data: &[u8], use_color: bool) -> Result<Vec<Frame>> {
-    let blob = parse_packed_cframes(data)?;
-    let mut frames = Vec::with_capacity(blob.len());
-    for index in 0..blob.len() {
-        let cframe = blob.decode_frame(index).with_context(|| format!("decoding packed animation frame {index}"))?;
-        let text = cframe.to_text();
-        if use_color {
-            frames.push(Frame::with_color(text, cframe));
-        } else {
-            frames.push(Frame::text_only(text));
-        }
-    }
-    Ok(frames)
+fn is_playback_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".bin", ".cframes", ".csmv", ".cfpk", ".bin.gz", ".json.gz", ".json"].iter().any(|ext| lower.ends_with(ext))
 }
 
 fn find_standalone_binary(directory: &Path) -> Result<Option<PathBuf>> {
@@ -715,10 +987,27 @@ fn find_standalone_binary(directory: &Path) -> Result<Option<PathBuf>> {
         if !path.is_file() {
             continue;
         }
-        let is_binary = path.extension().and_then(|extension| extension.to_str()).is_some_and(|extension| extension.eq_ignore_ascii_case("bin") || extension.eq_ignore_ascii_case("cframes"));
-        if is_binary {
+        if path.file_name().and_then(|name| name.to_str()).is_some_and(is_playback_filename) {
             binaries.push(path);
         }
+    }
+    // A transport manifest names its tile files. A sibling JSON metadata file
+    // is common in older exports and must not displace an existing binary.
+    if binaries.len() > 1 {
+        let mut primary = Vec::new();
+        for path in &binaries {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or_default().to_ascii_lowercase();
+            let input = Input::Path(path.clone());
+            if name.ends_with(".json") || name.ends_with(".json.gz") {
+                if matches!(Frames::open(&input), Ok(Frames::Tiles(_))) { primary.push(path.clone()); }
+            } else if name.ends_with(".bin.gz") {
+                let file = input::Bytes::open(&input)?;
+                if tiles::is_archive(&file.read(0..file.len.min(20))?) { primary.push(path.clone()); }
+            } else {
+                primary.push(path.clone());
+            }
+        }
+        if !primary.is_empty() { binaries = primary; }
     }
     binaries.sort();
     match binaries.len() {
@@ -832,8 +1121,8 @@ mod tests {
     }
 
     #[test]
-    fn validates_the_eth_frame_fixture_before_saving() {
-        validate_animation_source(Path::new("test/eth")).unwrap();
+    fn validates_the_bundled_frame_fixture_before_saving() {
+        validate_animation_source(Path::new("test/familyguy")).unwrap();
     }
 
     #[test]
@@ -841,6 +1130,195 @@ mod tests {
         let cli = Cli::try_parse_from(["casciit", "config", "set", "save-path", "library"]).unwrap();
 
         assert!(matches!(cli.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::SavePath {path}})})) if path == PathBuf::from("library")));
+    }
+
+    #[test]
+    fn parses_the_default_color_setting_command() {
+        let enabled = Cli::try_parse_from(["casciit", "config", "set", "color", "on"]).unwrap();
+        let disabled = Cli::try_parse_from(["casciit", "config", "set", "color", "off"]).unwrap();
+
+        assert!(matches!(enabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Color {value: OnOff::On}})}))));
+        assert!(matches!(disabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Color {value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn parses_the_default_fps_setting_command() {
+        let cli = Cli::try_parse_from(["casciit", "config", "set", "fps", "30"]).unwrap();
+
+        assert!(matches!(cli.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fps {fps: 30}})}))));
+        assert!(Cli::try_parse_from(["casciit", "config", "set", "fps", "0"]).is_err());
+        assert!(Cli::try_parse_from(["casciit", "frames", "--fps", "0"]).is_err());
+    }
+
+    #[test]
+    fn parses_the_default_fit_setting_command() {
+        let enabled = Cli::try_parse_from(["casciit", "config", "set", "fit", "on"]).unwrap();
+        let disabled = Cli::try_parse_from(["casciit", "config", "set", "fit", "off"]).unwrap();
+
+        assert!(matches!(enabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fit {value: OnOff::On}})}))));
+        assert!(matches!(disabled.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Fit {value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn parses_loop_and_information_bar_setting_commands() {
+        let looping = Cli::try_parse_from(["casciit", "config", "set", "loop", "off"]).unwrap();
+        let hidden = Cli::try_parse_from(["casciit", "config", "set", "hide-bar", "on"]).unwrap();
+        let frame = Cli::try_parse_from(["casciit", "config", "set", "bar", "frame", "off"]).unwrap();
+
+        assert!(matches!(looping.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Loop {value: OnOff::Off}})}))));
+        assert!(matches!(hidden.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::HideBar {value: OnOff::On}})}))));
+        assert!(matches!(frame.command, Some(Command::Config(ConfigArgs {command: Some(ConfigCommand::Set {setting: ConfigSetting::Bar {field: BarField::Frame, value: OnOff::Off}})}))));
+    }
+
+    #[test]
+    fn playback_uses_the_color_setting_unless_explicitly_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let color_args = Cli::try_parse_from(["casciit", "frames", "--color"]).unwrap().playback;
+        let monochrome_args = Cli::try_parse_from(["casciit", "frames", "--no-color"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: true,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_uses_color(&default_args, &app_settings));
+        assert!(!playback_uses_color(&monochrome_args, &app_settings));
+        app_settings.color = false;
+        assert!(!playback_uses_color(&default_args, &app_settings));
+        assert!(playback_uses_color(&color_args, &app_settings));
+    }
+
+    #[test]
+    fn playback_fps_prefers_cli_then_project_then_settings() {
+        let app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: false,
+            fps: 30,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert_eq!(playback_fps(Some(60), Some(24), &app_settings), 60);
+        assert_eq!(playback_fps(None, Some(24), &app_settings), 24);
+        assert_eq!(playback_fps(None, None, &app_settings), 30);
+    }
+
+    #[test]
+    fn playback_uses_the_fit_setting_unless_explicitly_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let fit_args = Cli::try_parse_from(["casciit", "frames", "--fit"]).unwrap().playback;
+        let native_args = Cli::try_parse_from(["casciit", "frames", "--no-fit"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: false,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_fits_terminal(&default_args, &app_settings));
+        assert!(!playback_fits_terminal(&native_args, &app_settings));
+        app_settings.fit = false;
+        assert!(!playback_fits_terminal(&default_args, &app_settings));
+        assert!(playback_fits_terminal(&fit_args, &app_settings));
+        assert!(Cli::try_parse_from(["casciit", "frames", "--fit", "--no-fit"]).is_err());
+    }
+
+    #[test]
+    fn playback_uses_loop_and_bar_settings_unless_overridden() {
+        let default_args = Cli::try_parse_from(["casciit", "frames"]).unwrap().playback;
+        let once_args = Cli::try_parse_from(["casciit", "frames", "--once"]).unwrap().playback;
+        let loop_args = Cli::try_parse_from(["casciit", "frames", "--loop"]).unwrap().playback;
+        let hidden_args = Cli::try_parse_from(["casciit", "frames", "--hide-bar"]).unwrap().playback;
+        let shown_args = Cli::try_parse_from(["casciit", "frames", "--show-bar"]).unwrap().playback;
+        let mut app_settings = settings::Settings {
+            name: settings::APP_NAME.to_string(),
+            version: settings::APP_VERSION.to_string(),
+            binary_path: PathBuf::from("casciit"),
+            save_path: PathBuf::from("animations"),
+            color: true,
+            fps: settings::DEFAULT_FPS,
+            fit: true,
+            loop_playback: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+            schema_version: settings::SETTINGS_SCHEMA_VERSION,
+        };
+
+        assert!(playback_loops(&default_args, &app_settings));
+        assert!(!playback_loops(&once_args, &app_settings));
+        assert!(!playback_hides_bar(&default_args, &app_settings));
+        assert!(playback_hides_bar(&hidden_args, &app_settings));
+        app_settings.loop_playback = false;
+        app_settings.hide_bar = true;
+        assert!(!playback_loops(&default_args, &app_settings));
+        assert!(playback_loops(&loop_args, &app_settings));
+        assert!(playback_hides_bar(&default_args, &app_settings));
+        assert!(!playback_hides_bar(&shown_args, &app_settings));
+        assert!(Cli::try_parse_from(["casciit", "frames", "--once", "--loop"]).is_err());
+        assert!(Cli::try_parse_from(["casciit", "frames", "--show-bar", "--hide-bar"]).is_err());
+    }
+
+    #[test]
+    fn every_information_bar_field_can_be_hidden_independently() {
+        let mut bar = settings::BarSettings::default();
+        for field in [BarField::Frame, BarField::Range, BarField::State, BarField::Fps, BarField::Loop, BarField::Fit, BarField::Color, BarField::Audio, BarField::Controls] {
+            set_bar_field(&mut bar, field, false);
+        }
+
+        assert_eq!(bar, settings::BarSettings {frame: false, range: false, state: false, fps: false, loop_mode: false, fit: false, color: false, audio: false, controls: false});
+    }
+
+    #[test]
+    fn status_text_only_contains_visible_bar_fields() {
+        let mut controller = AnimationController::new(30);
+        controller.set_frame_count(2);
+        controller.play();
+        let mut display = DisplayState {
+            colors: ProjectDetails::default().frame_colors(),
+            has_any_color: true,
+            audio_status: "no".into(), mode: ColorMode::Full, grid: None, seek_input: None,
+            fit_to_terminal: true,
+            hide_bar: false,
+            bar: settings::BarSettings::default(),
+        };
+
+        let complete = status_text(&controller, 0, 2, &display);
+        assert!(complete.contains("frame 1/2"));
+        assert!(complete.contains("30 fps"));
+        assert!(complete.contains("audio:no"));
+        display.bar.frame = false;
+        display.bar.fps = false;
+        display.bar.audio = false;
+        let filtered = status_text(&controller, 0, 2, &display);
+        assert!(!filtered.contains("frame 1/2"));
+        assert!(!filtered.contains("30 fps"));
+        assert!(!filtered.contains("audio:no"));
+    }
+
+    #[test]
+    fn rejects_conflicting_color_overrides() {
+        assert!(Cli::try_parse_from(["casciit", "frames", "--color", "--no-color"]).is_err());
     }
 
     #[test]
@@ -921,7 +1399,26 @@ mod tests {
 
     #[test]
     fn text_sampling_preserves_unicode_characters() {
-        assert_eq!(sample_text_line("é λ", 3, 3, false), vec!['é', ' ', 'λ']);
+        assert_eq!(sample_text_line("é λ", 3, 3, false), "é λ");
+    }
+
+    #[test]
+    fn text_rows_overwrite_spaces_and_preserve_terminal_cell_width() {
+        assert_eq!(sample_text_line("A", 4, 4, false), "A   ");
+        assert_eq!(sample_text_line("界e\u{301}", 4, 4, false), "界e\u{301} ");
+        assert_eq!(sample_text_line("a界", 3, 2, false), "a ");
+    }
+
+    fn load_packed_frames(path: &Path, color: bool) -> Result<Vec<Frame>> {
+        let mut frames = Frames::open(&Input::from_path(path)?)?;
+        (0..frames.count()).map(|index| frames.frame(index, 0, color)).collect()
+    }
+
+    fn frames_from_binary_data(bytes: &[u8], color: bool) -> Result<Vec<Frame>> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("test.bin");
+        fs::write(&path, bytes)?;
+        load_packed_frames(&path, color)
     }
 
     fn encoded_cframe(character: u8, background: [u8; 3]) -> Vec<u8> {
@@ -996,7 +1493,7 @@ mod tests {
         data.push(cascii_core_view::CFRAME_EXT_FLAG_HAS_BG);
         data.extend_from_slice(&[10, 20, 30, 40, 50, 60]);
 
-        let frames = frames_from_packed_data(&data, true).unwrap();
+        let frames = frames_from_binary_data(&data, true).unwrap();
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].content, "AB\n");
@@ -1013,9 +1510,12 @@ mod tests {
         data.extend_from_slice(&1_u32.to_le_bytes());
         data.extend_from_slice(&[b'X', 255, 255, 255]);
 
-        let frames = frames_from_packed_data(&data, false).unwrap();
+        let frames = frames_from_binary_data(&data, false).unwrap();
 
         assert_eq!(frames[0].content, "X\n");
         assert!(frames[0].cframe.is_none());
     }
 }
+
+#[cfg(test)]
+mod playback_tests;
